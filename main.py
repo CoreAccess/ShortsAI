@@ -15,8 +15,6 @@ from Components.SentimentAnalysis import analyze_emotions
 from Components.Subtitles import write_srt, burn_subtitles
 from Components.UserInterface import render_ui  # Import the render_ui function
 
-# github change test
-
 # UI input moved to Components/UserInterface.py
 user_input, uploaded_file = render_ui()  # Render the UI and get user inputs
 
