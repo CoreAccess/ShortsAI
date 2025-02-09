@@ -1,4 +1,4 @@
-# Shorts AI (1 Minute Short Clip Creator For YouTube & Tiktok)
+# Shorts AI (Short Clip Creator For YouTube & Tiktok)
 
 This project is designed to take any YouTube video or video on your localhost and exact interesting 1 minute short clips from them, add subtitles to the clips and get them ready to upload to YouTube, all done programmatically with the help of AI
 
