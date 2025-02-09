@@ -1,0 +1,12 @@
+streamlit
+moviepy==2.0.0.dev2
+transformers
+opencv-python
+numpy
+Pillow
+ffmpeg-python
+faster-whisper
+requests
+torch==1.12.1+cu126 --extra-index-url https://download.pytorch.org/whl/cu126
+torchvision==0.13.1+cu126 --extra-index-url https://download.pytorch.org/whl/cu126
+torchaudio==0.12.1+cu126 --extra-index-url https://download.pytorch.org/whl/cu126
