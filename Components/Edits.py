@@ -1,51 +1,61 @@
-# Import the VideoFileClip class from the moviepy library
 from moviepy.video.io.VideoFileClip import VideoFileClip
-import streamlit as st  # Import the streamlit library and alias it as st
+import streamlit as st
 import cv2
 import numpy as np
 
 
+# ----------------------------------------------------------------------------
+# Extract audio from a video file
+# ----------------------------------------------------------------------------
 def extractAudio(video_path, audio_path):
-    # Define a function called extractAudio that takes the video file path and the desired audio file path as input
-    try:
-        # Try to execute the following code block
-        video_clip = VideoFileClip(video_path)
+    try:  # Try to execute the following code block
+
         # Create a VideoFileClip object from the given video path
-        video_clip.audio.write_audiofile(audio_path)
+        video_clip = VideoFileClip(video_path)
+
         # Extract the audio from the video clip and save it to the specified audio path
-        video_clip.close()
+        video_clip.audio.write_audiofile(audio_path)
+
         # Close the video clip to release resources
+        video_clip.close()
+
+        # Display a message indicating that the audio extraction is complete
         st.write(f"Extracted Audio To: {audio_path}")
-        # Write a message to the streamlit app indicating the audio extraction was successful
-        return audio_path
+
         # Return the path to the extracted audio file
+        return audio_path
+
+    # If an exception occurs during the try block, execute this code block
     except Exception as e:
-        # If an exception occurs during the try block, execute this code block
+        # Write an error message
         st.write(f"An error occurred while extracting audio: {e}")
-        # Write an error message to the streamlit app
+
+        # Check if the video_clip variable exists in the local scope
         if 'video_clip' in locals():
-            # Check if the video_clip variable exists in the local scope
-            video_clip.close()
             # If it exists, close the video clip to release resources
-        return None
+            video_clip.close()
+
         # Return None to indicate that the audio extraction failed
+        return None
 
 
+# ----------------------------------------------------------------------------
+# Crop a video file
+# ----------------------------------------------------------------------------
 def crop_video(input_file, output_file, start_time, end_time):
-    # Define a function called crop_video that takes the input video file path, output video file path, start time, and end time as input
+    # Open the input video file as a VideoFileClip object using a context manager
     with VideoFileClip(input_file) as video:
-        # Open the input video file as a VideoFileClip object using a context manager
-        cropped_video = video.subclip(start_time, end_time)
         # Create a subclip of the video from the start time to the end time
-        cropped_video.write_videofile(output_file, codec='libx264')
+        cropped_video = video.subclip(start_time, end_time)
+
         # Write the cropped video to the specified output file using the libx264 codec
+        cropped_video.write_videofile(output_file, codec='libx264')
 
 
+# ----------------------------------------------------------------------------
+# Detect a face in a video and crop the video around the face
+# ----------------------------------------------------------------------------
 def detect_face_and_crop(video_path, output_path, start_time, end_time):
-    """
-    Detect a face in the video within the given time range, then crop and
-    resize the video to a fixed 1080x1920 (9:16) resolution.
-    """
     try:
         with VideoFileClip(video_path) as video:
             subclip = video.subclip(start_time, min(end_time, start_time + 59))
