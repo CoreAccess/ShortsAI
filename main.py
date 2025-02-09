@@ -1,18 +1,13 @@
-import os  # Import the os module for interacting with the operating system
-import tempfile  # Import the tempfile module for creating temporary files
-import streamlit as st  # Import the Streamlit library
-import torch  # Import the torch library
-# Import components
-# Import functions for audio extraction and video cropping
-from Components.Edits import extractAudio, crop_video, detect_face_and_crop
-from Components.Helpers import get_file_hash  # Import the get_file_hash function
-# Import the transcribe_audio function
+import os
+import tempfile
+import streamlit as st
+import torch
+from Components.Edits import extractAudio, detect_face_and_crop
+from Components.Helpers import get_file_hash
 from Components.Transcriptions import transcribe_audio
-# Import the analyze_emotions function
 from Components.SentimentAnalysis import analyze_emotions
-# Import functions for subtitle creation and burning
 from Components.Subtitles import write_srt, burn_subtitles
-from Components.UserInterface import render_ui  # Import the render_ui function
+from Components.UserInterface import render_ui
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
 # Render the UI and get user inputs
