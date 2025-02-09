@@ -3,10 +3,11 @@ import streamlit as st
 import cv2
 import numpy as np
 
-
 # ----------------------------------------------------------------------------
 # Extract audio from a video file
 # ----------------------------------------------------------------------------
+
+
 def extractAudio(video_path, audio_path):
     try:  # Try to execute the following code block
 
@@ -19,16 +20,16 @@ def extractAudio(video_path, audio_path):
         # Close the video clip to release resources
         video_clip.close()
 
-        # Display a message indicating that the audio extraction is complete
-        st.write(f"Extracted Audio To: {audio_path}")
+        # *** Debugging Message *** #
+        print(f"Audio Extracted To: {audio_path}")
 
         # Return the path to the extracted audio file
         return audio_path
 
     # If an exception occurs during the try block, execute this code block
     except Exception as e:
-        # Write an error message
-        st.write(f"An error occurred while extracting audio: {e}")
+        # *** Debugging Message *** #
+        print(f"An Error Occurred While Extracting Audio: {e}")
 
         # Check if the video_clip variable exists in the local scope
         if 'video_clip' in locals():

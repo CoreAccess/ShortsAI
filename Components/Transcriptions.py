@@ -9,55 +9,58 @@ from Components.Helpers import load_transcription_segments
 def transcribe_audio(audio_path, transcript_path, st, torch):
     # If no transcript file exists, transcribe the audio
     if not __import__("os").path.exists(transcript_path):
-        with st.spinner("Transcribing audio..."):  # Display a spinner
+        # Check if a GPU is available, otherwise use the CPU
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        # Load the Whisper model
+        model = WhisperModel("base.en", device=device_str)
 
-            # Load the Whisper model
-            model = WhisperModel("base.en", device=device_str)
+        # Transcribe the audio using the Whisper model
+        segments, _ = model.transcribe(
+            audio_path,
+            beam_size=5,
+            language="en",
+            max_new_tokens=128,
+            condition_on_previous_text=False
+        )
 
-            # Transcribe the audio using the Whisper model
-            segments, _ = model.transcribe(
-                audio_path,
-                beam_size=5,
-                language="en",
-                max_new_tokens=128,
-                condition_on_previous_text=False
-            )
+        # Convert the segments iterator to a list
+        segments = list(segments)
 
-            # Convert the segments iterator to a list
-            segments = list(segments)
+        # Initialize an empty list to store the transcription segments
+        transcription_segments = []
 
-            # Initialize an empty list to store the transcription segments
-            transcription_segments = []
+        # Initialize an empty string to store the complete transcription
+        transcription = ""
 
-            # Initialize an empty string to store the complete transcription
-            transcription = ""
+        # Iterate over each segment in the transcription
+        for seg in segments:
+            # Replace musical notes with empty strings (Since they cause erorrs later)
+            start, end, text = seg.start, seg.end, seg.text.replace(
+                '\u266a', '')
 
-            # Iterate over each segment in the transcription
-            for seg in segments:
-                # Replace musical notes with empty strings
-                start, end, text = seg.start, seg.end, seg.text.replace(
-                    '\u266a', '')
+            # Append the segment information to the list of transcription segments
+            transcription_segments.append(
+                {"timestamp": [start, end], "text": text})
 
-                # Append the segment information to the list of transcription segments
-                transcription_segments.append(
-                    {"timestamp": [start, end], "text": text})
+            # Append the segment text to the transcription string with timestamps
+            transcription += f"[{start:.2f} - {end:.2f}] {text}\n"
 
-                # Append the segment text to the complete transcription string with timestamps
-                transcription += f"[{start:.2f} - {end:.2f}] {text}\n"
+        # Open the transcript file in write mode with UTF-8 encoding
+        with open(transcript_path, 'w', encoding='utf-8') as f:
 
-            # Open the transcript file in write mode with UTF-8 encoding
-            with open(transcript_path, 'w', encoding='utf-8') as f:
+            # Write the complete transcription to the file
+            f.write(transcription)
 
-                # Write the complete transcription to the file
-                f.write(transcription)
+        # *** Debugging Message *** #
+        print("Transcription Process Was a Success...")
 
-        st.write("Transcription complete!")  # Display a message
-    else:  # If the transcript file exists
+    else:  # If we already have a transcript
 
         # Load the transcription segments from the file
         transcription_segments = load_transcription_segments(transcript_path)
 
-        st.write("Using existing transcript.")  # Display a message
+        # *** Debugging Message *** #
+        print("Transcription Already Exists, Using Existing Transcription...")
+
     return transcription_segments

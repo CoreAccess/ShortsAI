@@ -9,6 +9,7 @@ from Components.SentimentAnalysis import analyze_emotions
 from Components.Subtitles import write_srt, burn_subtitles
 from Components.UserInterface import render_ui
 from moviepy.video.io.VideoFileClip import VideoFileClip
+import sys
 
 # Render the UI and get user inputs
 uploaded_file = render_ui()
@@ -18,21 +19,25 @@ os.makedirs("temp_files", exist_ok=True)
 
 # Check if a file is provided
 if uploaded_file:
-    temp_file_path = None  # Initialize a variable for the temporary file path
+
+    # Initialize a variable for the temporary file path
+    temp_file_path = None
+
     try:
-        st.write("Starting audio extraction...")  # Display a message
+        # *** Debugging Message *** #
+        print("Video Processing Has Begun...")
 
         # Create a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
+
             # Write the uploaded file content to the temporary file
             temp_file.write(uploaded_file.read())
 
             # Get the path of the temporary file
             temp_file_path = temp_file.name
 
-        # Display a message
-        st.write(
-            f"Saved uploaded file to temporary file: {temp_file_path}")
+        # *** Debugging Message *** #
+        print("Making Video Hash & Paths...")
 
         # Generate a hash for the video file
         file_hash = get_file_hash(temp_file_path)
@@ -46,6 +51,9 @@ if uploaded_file:
         # Define the emotion analysis file path
         emotion_path = f"temp_files/{file_hash}_emotions.txt"
 
+        # *** Debugging Message *** #
+        print("Starting The Audio Processing...")
+
         # Check if an audio file doesn't already exists
         if not os.path.exists(audio_path):
             # Load the video file
@@ -53,14 +61,29 @@ if uploaded_file:
                 audio_path = extractAudio(
                     temp_file_path, audio_path)  # Extract the audio
 
-            st.write("Audio extraction complete!")  # Display a message
+            # If the audio extraction failed
+            if audio_path is None:
+                # *** Debugging Message *** #
+                print("Audio Extraction Failed. See Error Message Above.")
+
+                # Exit the program
+                sys.exit(1)
+
+            # *** Debugging Message *** #
+            print("Audio Processing Was a Success...")
         else:
-            # Display a message
-            st.write("Audio already exists; skipping extraction.")
+            # *** Debugging Message *** #
+            print("Audio File Already Exists; Skipping Extraction...")
+
+        # *** Debugging Message *** #
+        print("Starting Audio Transcription Process...")
 
         # Transcription using faster_whisper
         transcription_segments = transcribe_audio(
             audio_path, transcript_path, st, torch)  # Transcribe the audio
+
+        # *** Debugging Message *** #
+        print("Starting Sentiment Analysis Process...")
 
         # Emotion analysis using transformers pipeline
         emotions = analyze_emotions(
@@ -78,10 +101,6 @@ if uploaded_file:
             # Calculate the end time
             end_time = start_time + 59.0
 
-            # Display a message
-            st.write(
-                f"Extracting clip from {start_time:.2f}s to {end_time:.2f}s.")
-
             # Iterate over the transcription segments
             for segment in transcription_segments:
                 # Update the start time
@@ -95,17 +114,21 @@ if uploaded_file:
             # Define the subtitled file path
             subtitled_file = f"temp_files/{file_hash}_dramatic_clip_with_subtitles.mp4"
 
+            # *** Debugging Message *** #
+            print(
+                f"Extracting Clip From {start_time:.2f}s To {end_time:.2f}s.")
+
             # Check if the cropped file exists
             if not os.path.exists(cropped_file):
                 # Detect face and crop using clip range
                 detect_face_and_crop(
                     temp_file_path, cropped_file, start_time, end_time)
 
-                # Display a message
-                st.write(f"Extracted clip: {cropped_file}")
+                # *** Debugging Message *** #
+                print(f"Clip Was Extracted To: {cropped_file}")
             else:
-                # Display a message
-                st.write(f"Reusing cropped clip: {cropped_file}")
+                # *** Debugging Message *** #
+                print(f"Clip Already Exists Using: {cropped_file}")
 
             # Create subtitles
             subtitles = [
@@ -118,6 +141,9 @@ if uploaded_file:
             # Define the SRT file path
             srt_file = f"temp_files/{file_hash}_subtitles.srt"
 
+            # *** Debugging Message *** #
+            print("Starting Subtitle Generation...")
+
             # Write the subtitles to the SRT file
             write_srt(subtitles, srt_file)
 
@@ -126,30 +152,30 @@ if uploaded_file:
                 # Burn the subtitles
                 burn_subtitles(cropped_file, srt_file, subtitled_file)
 
-                # Display a message
-                st.write(
-                    f"Generated clip with burnt subtitles: {subtitled_file}")
+                # *** Debugging Message *** #
+                print(
+                    f"Generated Clip With Subtitles At: {subtitled_file}")
             else:
-                # Display a message
-                st.write(f"Using existing subtitled clip: {subtitled_file}")
+                # *** Debugging Message *** #
+                print(f"Existing Clip Already Exists Using: {subtitled_file}")
 
-            # Display a success message
-            st.success(f"Final output ready: {subtitled_file}")
+            # *** Debugging Message *** #
+            print(f"Final Clip Ready For Viewing At: {subtitled_file}")
         else:
-            # Display a message
-            st.write("No dramatic segments detected.")
+            # *** Debugging Message *** #
+            print("No Dramatic Segments Detected...")
 
-        # Display a success message
-        st.success("Processing completed successfully!")
+        # *** Debugging Message *** #
+        print("Processing Completed Successfully! Go Watch The Clip!")
 
     except Exception as e:
-        # Display a processing error message
-        st.error(f"Processing error: {e}")
+        # *** Debugging Message *** #
+        print(f"There Was a Processing Error: {e}")
     finally:
         # Check if the temporary file exists
         if temp_file_path and os.path.exists(temp_file_path):
             # Remove the temporary file
             os.remove(temp_file_path)
 
-            # Display a message
-            st.write(f"Deleted temporary file {temp_file_path}")
+            # *** Debugging Message *** #
+            print(f"Temporary File Has Been Deleted From: {temp_file_path}")

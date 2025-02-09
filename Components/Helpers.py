@@ -49,6 +49,7 @@ def chunk_text_with_timestamps(transcription_segments, max_length=192):
 
         # Check if adding the current segment exceeds the maximum length
         if current_length + len(text.split()) > max_length:
+
             # Append the current chunk to the list of chunks
             chunks.append(current_chunk)
 
