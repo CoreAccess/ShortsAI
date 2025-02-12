@@ -1,2 +1,5 @@
 .venv/
 uploads/
+app.log
+finished_videos/
+temp_files/
