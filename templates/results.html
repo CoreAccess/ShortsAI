@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Finished Videos</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+</head>
+<body>
+    <div class="results-container">
+        <h1>Finished Videos</h1>
+        {% if videos %}
+            <table id="uploaded_files_table" style="display: table;">
+                <thead>
+                    <tr>
+                        <th>Video Name</th>
+                        <th>File Size</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for video in videos %}
+                        <tr>
+                            <td>{{ video.name }}</td>
+                            <td>{{ '%.2f MB' % (video.size / 1048576) }}</td>
+                            <td><a href="{{ video.path }}" download>Download</a></td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p>No finished videos available.</p>
+        {% endif %}
+        <a href="/" class="back-button">Back to Upload</a>
+    </div>
+</body>
+</html>

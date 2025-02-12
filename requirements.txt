@@ -1,0 +1,10 @@
+Flask==2.3.2
+torch
+opencv-python
+numpy
+ffmpeg-python
+moviepy==2.0.0.dev2
+transformers
+faster-whisper
+pydub
+datasets

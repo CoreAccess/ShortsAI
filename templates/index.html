@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video File Upload</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <script src="/static/script.js" defer></script>
+</head>
+<body>
+    <h1>Select Video File(s) To Upload</h1>
+    <div class="finished-videos-status">
+        <button id="view_finished_videos" style="display: none;">View Finished Videos</button>
+        <span id="finished_count" class="finished-count"></span>
+    </div>
+    <form action="/upload" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" multiple>
+        <button type="submit">Upload</button>
+        <div id="success_message">Files uploaded successfully!</div>
+        <progress value="0" max="100"></progress>
+    </form>
+
+    <h2 id="uploaded_files_header" style="display: none;">Uploaded Files</h2>
+    <table id="uploaded_files_table">
+        <thead>
+            <tr>
+                <th>File Name</th>
+                <th>File Size</th>
+                <th>Progress</th>
+            </tr>
+        </thead>
+        <tbody>
+            <!-- Files will be dynamically added here -->
+        </tbody>
+    </table>
+    <button id="begin_processing_button" style="display: none;">Begin Processing</button>
+</body>
+</html>
