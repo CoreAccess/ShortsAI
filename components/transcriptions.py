@@ -21,29 +21,31 @@ def transcribe_audio(audio_path, transcript_path):
             print("Transcribing audio file...")
             segments, _ = model.transcribe(
                 audio_path,
-                beam_size=5,
+                beam_size=4,
                 language="en",
                 condition_on_previous_text=False,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
+                vad_parameters=dict(min_silence_duration_ms=500),
+                word_timestamps=True
             )
             
             # Combine transcription results
             transcription_segments = []
             for seg in segments:
-                start, end, text = seg.start, seg.end, seg.text.replace('\u266a', '')
-                transcription_segments.append({
-                    "timestamp": [start, end],
-                    "text": text
-                })
-            
+                for word in seg.words:
+                    start, end, text = word.start, word.end, word.word.replace('\u266a', '*Music*')
+                    transcription_segments.append({
+                        "timestamp": [start, end],  # Keep timestamps in seconds
+                        "text": text
+                    })
+
             # Save final transcription
             print("Saving final transcription...")
             with open(transcript_path, 'w', encoding='utf-8') as f:
                 for segment in transcription_segments:
                     start, end = segment["timestamp"]
                     text = segment["text"]
-                    f.write(f"[{start:.2f} - {end:.2f}] {text}\n")
+                    f.write(f"[{start:.3f} - {end:.3f}] {text}\n")
             
             print("Transcription completed successfully")
             return transcription_segments

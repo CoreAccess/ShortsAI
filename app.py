@@ -2,68 +2,12 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from components.processing import process_video
 import os
 import threading
-import signal
-import sys
-import torch
-import logging
-import traceback
-from threading import Timer
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('app.log')
-    ]
-)
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads/'
 app.config['FINISHED_FOLDER'] = 'finished_videos/'
 app.config['TEMP_FOLDER'] = 'temp_files/'
 processing_progress = {}
-
-class ProcessingWatchdog:
-    def __init__(self, timeout, filename):
-        self.timeout = timeout
-        self.filename = filename
-        self.timer = None 
-
-    def start(self):
-        self.timer = Timer(self.timeout, self.handle_timeout)
-        self.timer.start()
-
-    def stop(self):
-        if self.timer:
-            self.timer.cancel()
-
-    def handle_timeout(self):
-        logging.error(f"Processing timeout detected for {self.filename}")
-        cleanup_resources()
-        if self.filename in processing_progress:
-            processing_progress[self.filename] = {"progress": 0, "error": True}
-
-def cleanup_resources():
-    """Clean up GPU and system resources"""
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as e:
-        logging.error(f"Error during resource cleanup: {e}")
-
-
-def signal_handler(sig, frame):
-    """Handle shutdown signals gracefully"""
-    logging.info("Shutting down server...")
-    cleanup_resources()
-    sys.exit(0)
-
-# Register the signal handler
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
 
 def cleanup_progress_dict():
     # Clean up completed or failed entries
@@ -85,8 +29,6 @@ def init_app():
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     os.makedirs(app.config['FINISHED_FOLDER'], exist_ok=True)
     os.makedirs(app.config['TEMP_FOLDER'], exist_ok=True)
-    
-    logging.info("Application initialized - waiting for user to start processing")
 
 # Initialize the application
 init_app()
@@ -124,48 +66,40 @@ def begin_processing():
         
         # Clean up old entries
         cleanup_progress_dict()
-        cleanup_resources()
         
-        for filename in os.listdir(app.config['UPLOAD_FOLDER']):
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            if os.path.isfile(file_path) and filename.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
-                if filename in processing_progress:
-                    continue
-                    
-                filepath = os.path.abspath(file_path)
-                processing_progress[filename] = {"progress": 0, "error": False}
-                
-                # Create watchdog with 30-minute timeout
-                watchdog = ProcessingWatchdog(1800, filename)
-                
-                def process_video_with_monitoring(*args):
-                    try:
-                        watchdog.start()
-                        process_video(*args)
-                        watchdog.stop()
-                    except Exception as e:
-                        watchdog.stop()
-                        logging.error(f"Unhandled exception in processing thread: {str(e)}")
-                        logging.error(f"Stack trace: {traceback.format_exc()}")
-                        cleanup_resources()
-                
-                thread = threading.Thread(target=process_video_with_monitoring, args=(
-                    filepath, 
-                    processing_progress,
-                    app.config['TEMP_FOLDER'],
-                    app.config['FINISHED_FOLDER']
-                ))
-                thread.daemon = True
-                thread.start()
-                
-                logging.info(f"Started processing thread for {filename}")
-                return jsonify({'status': 'Processing started', 'filename': filename})
+        def process_next_video():
+            with app.app_context():
+                for filename in os.listdir(app.config['UPLOAD_FOLDER']): 
+                    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    if os.path.isfile(file_path) and filename.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
+                        if filename in processing_progress:
+                            continue
+                            
+                        filepath = os.path.abspath(file_path)
+                        processing_progress[filename] = {"progress": 0, "error": False}
+
+                        def process_video_with_monitoring(*args):
+                            try:
+                                process_video(*args)
+                            except Exception as e:
+                                print(f"Unhandled exception in processing thread: {str(e)}")
+                            finally:
+                                process_next_video()  # Process the next video after the current one finishes
+                        
+                        thread = threading.Thread(target=process_video_with_monitoring, args=(
+                            filepath, 
+                            processing_progress,
+                            app.config['TEMP_FOLDER'],
+                            app.config['FINISHED_FOLDER']
+                        ))
+                        thread.daemon = True
+                        thread.start()
+                        
+                        return jsonify({'status': 'Processing started', 'filename': filename})
+                return jsonify({'error': 'No files available for processing'}), 404
         
-        return jsonify({'error': 'No files available for processing'}), 404
+        return process_next_video()
     except Exception as e:
-        logging.error(f"Error in begin_processing route: {str(e)}")
-        logging.error(f"Stack trace: {traceback.format_exc()}")
-        cleanup_resources()
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/processing-progress/<filename>')
@@ -250,13 +184,6 @@ def favicon():
 @app.errorhandler(Exception)
 def handle_exception(e):
     """Handle any unhandled exception without crashing the server"""
-    # Log the error and stack trace
-    logging.error("Unhandled exception: %s", str(e))
-    logging.error("Stack trace: %s", traceback.format_exc())
-    
-    # Clean up resources
-    cleanup_resources()
-    
     # If this is a background thread error, update progress
     thread_name = threading.current_thread().name
     if thread_name != "MainThread":

@@ -1,11 +1,36 @@
 import os
 import shutil  # Import shutil for file operations
 from components.edits import extractAudio, detect_face_and_crop
-from components.helpers import get_file_hash, load_transcription_segments
+from components.helpers import get_file_hash, load_transcription_segments, find_best_chunks, find_sentence_start, find_sentence_end
 from components.transcriptions import transcribe_audio
 from components.sentiment_analysis import analyze_emotions
-from components.subtitles import write_srt, burn_subtitles
+from components.subtitles import write_ass, burn_subtitles
 from moviepy.video.io.VideoFileClip import VideoFileClip
+import sys
+
+def convert_to_sentence_level(word_segments):
+    sentence_segments = []
+    current_sentence = []
+    start_time = None
+    for word in word_segments:
+        if start_time is None:
+            start_time = word["timestamp"][0]
+        current_sentence.append(word["text"])
+        if word["text"].endswith(('.', '?', '!')):
+            end_time = word["timestamp"][1]
+            sentence_segments.append({
+                "timestamp": [start_time, end_time],
+                "text": ' '.join(current_sentence)
+            })
+            current_sentence = []
+            start_time = None
+    if current_sentence:
+        end_time = word_segments[-1]["timestamp"][1]
+        sentence_segments.append({
+            "timestamp": [start_time, end_time],
+            "text": ' '.join(current_sentence)
+        })
+    return sentence_segments
 
 def process_video(video_path, progress_dict, temp_dir, finished_dir):
     filename = os.path.basename(video_path)
@@ -20,7 +45,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         # Check if the video already exists in temp_files
         temp_file_path = os.path.join(temp_dir, os.path.basename(video_path))
         if not os.path.exists(temp_file_path):
-            temp_file_path = shutil.copy(video_path, temp_file_path)
+            shutil.copy(video_path, temp_file_path)
         else:
             print(f"Video file already exists in temp_files, using existing file: {temp_file_path}")
 
@@ -54,98 +79,94 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         progress_dict[filename] = {"progress": 25, "error": False}
 
         print("Starting Audio Transcription Process...")
-        transcription_success = False
-        max_retries = 3
-        retry_count = 0
-        
-        while not transcription_success and retry_count < max_retries:
-            try:
-                transcription_segments = transcribe_audio(audio_path, transcript_path)
-                if not transcription_segments and os.path.exists(transcript_path):
-                    # If transcription file exists but segments are empty, try to load it
-                    transcription_segments = load_transcription_segments(transcript_path)
-                
-                if not transcription_segments:
-                    retry_count += 1
-                    print(f"Transcription attempt {retry_count} failed, {'retrying' if retry_count < max_retries else 'giving up'}...")
-                    continue
-                
-                transcription_success = True
-                print("Transcription completed successfully")
-            except Exception as e:
-                print(f"Error in transcription attempt {retry_count + 1}: {str(e)}")
-                retry_count += 1
-                if retry_count >= max_retries:
-                    progress_dict[filename] = {"progress": 0, "error": True}
-                    raise Exception(f"Transcription failed after {max_retries} attempts")
-        
+
+        word_segments = transcribe_audio(audio_path, transcript_path)
+        word_segments = load_transcription_segments(transcript_path)
+
+        # Convert word-level transcription to sentence-level transcription
+        sentence_segments = convert_to_sentence_level(word_segments)
+
         progress_dict[filename] = {"progress": 40, "error": False}
 
         print("Starting Sentiment Analysis Process...")
         try:
-            emotions = analyze_emotions(transcription_segments, emotion_path)
+            emotions = analyze_emotions(sentence_segments, emotion_path)
             if not emotions:
                 raise Exception("Sentiment analysis failed or returned empty")
         except Exception as e:
             print(f"Error in sentiment analysis: {str(e)}")
             progress_dict[filename] = {"progress": 0, "error": True}
             raise
-        progress_dict[filename] = {"progress": 55, "error": False}
 
-        # Rest of the processing code...
-        dramatic_segments = [segment for segment in emotions if segment['label'] in [
-            'anger', 'fear', 'sadness']]
+        progress_dict[filename] = {"progress": 60, "error": False}
 
-        if dramatic_segments:
-            progress_dict[filename] = {"progress": 60, "error": False}
-            base_start = float(dramatic_segments[0]['start'])
+        # Find the best segments that are close to 59 seconds with highest emotional scores
+        best_chunks = find_best_chunks(emotions)
+        if not best_chunks:
+            print("No suitable segments found")
+            progress_dict[filename] = {"progress": 0, "error": True}
+            raise Exception("No suitable segments found")
+        
+        # print out the total best_chunks
+        print(f"Total best_chunks: {len(best_chunks)}")
 
-            for segment in transcription_segments:
-                if segment["timestamp"][1] >= base_start:
-                    start_time = segment["timestamp"][0]
-                    break
+        # Process top 3 non-overlapping segments
+        best_chunks = best_chunks[:1]
 
-            max_duration = 59.0
-            segments_in_range = [
-                segment for segment in transcription_segments
-                if segment["timestamp"][0] >= start_time and segment["timestamp"][1] <= start_time + max_duration
+        cropped_file = None
+        subtitled_file = None
+        ass_file = None
+
+        for chunk in best_chunks:
+            start_index, end_index, start_time, end_time = chunk
+            print(f"Processing chunk: Duration={end_time-start_time:.2f}s, Start={start_time:.2f}s, End={end_time:.2f}s")
+            
+            # Get word segments that fall within this chunk's time range, with a small buffer
+            buffer = 0.1  # 100ms buffer to catch nearby words
+            chunk_words = [
+                segment for segment in word_segments
+                if (segment["timestamp"][0] >= (start_time - buffer) and 
+                    segment["timestamp"][1] <= (end_time + buffer))
             ]
-            candidate_end = start_time
-            for segment in segments_in_range:
-                text = segment["text"].strip()
-                if text.endswith((".", "?", "!")):
-                    candidate_end = segment["timestamp"][1]
-            if candidate_end == start_time and segments_in_range:
-                candidate_end = segments_in_range[-1]["timestamp"][1]
-            end_time = candidate_end
+            
+            if not chunk_words:
+                print(f"No word segments found for chunk {start_time:.2f}-{end_time:.2f}")
+                continue
 
             print(f"Extracting Clip From {start_time:.2f}s To {end_time:.2f}s.")
+
             progress_dict[filename] = {"progress": 65, "error": False}
 
-            cropped_file = f"{temp_dir}/{file_hash}_dramatic_clip.mp4"
-            subtitled_file = f"{temp_dir}/{file_hash}_dramatic_clip_with_subtitles.mp4"
+            cropped_file = f"{temp_dir}/{file_hash}_dramatic_clip_{start_time:.2f}_{end_time:.2f}.mp4"
+            subtitled_file = f"{temp_dir}/{file_hash}_dramatic_clip_with_subtitles_{start_time:.2f}_{end_time:.2f}.mp4"
 
             if not os.path.exists(cropped_file):
-                detect_face_and_crop(temp_file_path, cropped_file, start_time, end_time)
-                print(f"Clip Was Extracted To: {cropped_file}")
-            else:
+                try:
+                    detect_face_and_crop(temp_file_path, cropped_file, start_time, end_time)
+                    print(f"Clip Was Extracted To: {cropped_file}")
+                except ValueError as e:
+                    print(f"No faces detected in the video segment: {str(e)}")
+                    continue
+            else: 
                 print(f"Clip Already Exists Using: {cropped_file}")
+
             progress_dict[filename] = {"progress": 80, "error": False}
 
+            # Create subtitles for the chunk using word-level segments
             subtitles = [
-                (segment["timestamp"][0] - start_time, segment["timestamp"][1] - start_time,
-                segment["text"].replace('\u266a', '*'))
-                for segment in transcription_segments
-                if segment["timestamp"][0] >= start_time and segment["timestamp"][1] <= end_time
+                (segment["timestamp"][0] - start_time, 
+                 segment["timestamp"][1] - start_time,
+                 segment["text"])
+                for segment in chunk_words
             ]
 
-            srt_file = f"{temp_dir}/{file_hash}_subtitles.srt"
+            ass_file = f"{temp_dir}/{file_hash}_subtitles_{start_time:.2f}_{end_time:.2f}.ass"
             print("Starting Subtitle Generation...")
-            write_srt(subtitles, srt_file)
+            write_ass(subtitles, ass_file)
             progress_dict[filename] = {"progress": 90, "error": False}
 
             if not os.path.exists(subtitled_file):
-                burn_subtitles(cropped_file, srt_file, subtitled_file)
+                burn_subtitles(cropped_file, ass_file, subtitled_file)
                 print(f"Generated Clip With Subtitles At: {subtitled_file}")
             else:
                 print(f"Existing Clip Already Exists Using: {subtitled_file}")
@@ -154,36 +175,24 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
             progress_dict[filename] = {"progress": 95, "error": False}
 
             # Move the final video to finished_videos folder
-            final_video_name = f"{os.path.splitext(filename)[0]}_short.mp4"
+            final_video_name = f"{os.path.splitext(filename)[0]}_short_{start_time:.2f}_{end_time:.2f}.mp4"
             final_video_path = os.path.join(finished_dir, final_video_name)
             shutil.copy2(subtitled_file, final_video_path)
             print(f"Moved final video to: {final_video_path}")
 
-            # Clean up temp files
-            temp_files = [
-                audio_path,
-                transcript_path,
-                emotion_path,
-                cropped_file,
-                srt_file,
-                subtitled_file
-            ]
+            # Clean up temp files after all clips are created
+            temp_files = [audio_path, transcript_path, emotion_path, cropped_file, ass_file, subtitled_file]
             for temp_file in temp_files:
-                if os.path.exists(temp_file):
+                if temp_file and os.path.exists(temp_file):
                     os.remove(temp_file)
                     print(f"Deleted temporary file: {temp_file}")
 
-            # Delete the original video from uploads
-            if os.path.exists(video_path):
-                os.remove(video_path)
-                print(f"Deleted original video from uploads: {video_path}")
+        # Delete the original video from uploads
+        if os.path.exists(video_path):
+            os.remove(video_path)
+            print(f"Deleted original video from uploads: {video_path}")
 
-            progress_dict[filename] = {"progress": 100, "error": False}
-        else:
-            print("No Dramatic Segments Detected...")
-            progress_dict[filename] = {"progress": 0, "error": True}
-
-        print("Processing Completed Successfully! Go Watch The Clip!")
+        progress_dict[filename] = {"progress": 100, "error": False}
 
     except Exception as e:
         print(f"Fatal error in process_video: {str(e)}")
@@ -197,5 +206,6 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
             try:
                 os.remove(temp_file_path)
                 print(f"Temporary File Has Been Deleted From: {temp_file_path}")
+                print("Processing Completed Successfully! Go Watch The Clips!")
             except Exception as e:
                 print(f"Error cleaning up temp file: {str(e)}")

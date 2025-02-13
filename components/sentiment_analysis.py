@@ -1,3 +1,6 @@
+import os
+os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from components.helpers import save_emotion_analysis
 from datasets import Dataset

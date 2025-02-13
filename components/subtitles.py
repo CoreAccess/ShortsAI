@@ -1,6 +1,7 @@
 import os
 import textwrap
 import ffmpeg
+import pysubs2
 from components.helpers import format_timestamp, get_video_duration
 
 # Dynamically determine the path to the subscribe image
@@ -8,33 +9,62 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 subscribe_img_path = os.path.join(PROJECT_DIR, "static", "assets", "youtube-subscribe.png")
 
 # ----------------------------------------------------------------------------
-# Create an SRT subtitle file.
+# Create an ASS subtitle file.
 # ----------------------------------------------------------------------------
 
+def write_ass(subtitles, ass_file_path):
+    subs = pysubs2.SSAFile()
+    subs.info['Title'] = "Styled Subtitles"
+    subs.styles['Default'] = pysubs2.SSAStyle(
+        fontname="impact",
+        fontsize=18,
+        primarycolor=pysubs2.Color(255, 255, 255),
+        outlinecolor=pysubs2.Color(0, 0, 0),
+        backcolor=pysubs2.Color(0, 0, 0, 100),
+        bold=-1,
+        italic=0,
+        underline=0,
+        strikeout=0,
+        scalex=100,
+        scaley=100,
+        spacing=0,
+        angle=0,
+        borderstyle=1,
+        outline=1,
+        shadow=0,
+        alignment=pysubs2.Alignment.BOTTOM_CENTER,
+        marginl=10,
+        marginr=10,
+        marginv=65,  # Move subtitles higher in the frame
+        encoding=1
+    )
 
-def write_srt(subtitles, srt_file_path):
-    max_chars = 40
-    max_lines = 3
-    index = 1
-    with open(srt_file_path, 'w', encoding='utf-8') as f:
-        for start, end, text in subtitles:
-            if end - start < 1.0:
-                end = start + 1.0
-            lines = textwrap.wrap(text, width=max_chars)[:max_lines]
-            # Prepend the override tag for center alignment
-            wrapped_text = "\n".join(lines)
-            f.write(f"{index}\n")
-            f.write(f"{format_timestamp(start)} --> {format_timestamp(end)}\n")
-            f.write(f"{wrapped_text}\n\n")
-            index += 1
+    for start, end, text in subtitles:
+        if end - start < 1.0:
+            end = start + 1.0
+        # Combine words into sentences
+        words = text.split()
+        # Highlight each word as it is spoken
+        highlighted_sentence = ''
+        for i, word in enumerate(words):
+            word_start = start + (end - start) * (i / len(words))
+            word_end = start + (end - start) * ((i + 1) / len(words))
+            highlighted_sentence += f"{{\\1c&H00FF00&\\fs24}}{word}{{\\r}} "
+            event = pysubs2.SSAEvent(
+                start=pysubs2.make_time(ms=word_start * 1000),
+                end=pysubs2.make_time(ms=word_end * 1000),
+                text=highlighted_sentence.strip()
+            )
+            subs.events.append(event)
+
+    subs.save(ass_file_path)
 
 # ----------------------------------------------------------------------------
 # Burn subtitles directly onto the video using ffmpeg.
 # ----------------------------------------------------------------------------
 
-
-def burn_subtitles(video_path, srt_path, output_path):
-    srt_path_fixed = srt_path.replace("\\", "/")
+def burn_subtitles(video_path, ass_path, output_path):
+    ass_path_fixed = ass_path.replace("\\", "/")
 
     # ------------------------------------------------------------------------
     # Step 1: Get video duration.
@@ -74,7 +104,7 @@ def burn_subtitles(video_path, srt_path, output_path):
 
         # Subtitle filter
         subtitles = input_video.filter(
-            'subtitles', srt_path_fixed, force_style='FontName=Impact,Alignment=2,MarginV=65'
+            'subtitles', ass_path_fixed
         )
 
         # Scale the overlay

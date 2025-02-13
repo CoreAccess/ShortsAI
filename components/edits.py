@@ -161,8 +161,8 @@ def detect_face_and_crop(video_path, output_path, start_time, end_time):
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-    # Helper: detect average face center at a given time.
-    def get_face_center(time_sec):
+    # Helper: detect the primary face center at a given time.
+    def get_primary_face_center(time_sec):
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_MSEC, time_sec * 1000)
         ret, frame = cap.read()
@@ -172,46 +172,43 @@ def detect_face_and_crop(video_path, output_path, start_time, end_time):
             faces = face_cascade.detectMultiScale(
                 gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
             if len(faces) == 0:
-                return in_width // 2, in_height // 2
-            avg_face_x = int(
-                sum(x + w//2 for (x, y, w, h) in faces) / len(faces))
-            avg_face_y = int(
-                sum(y + h//2 for (x, y, w, h) in faces) / len(faces))
+                return None
+            # Focus on the largest face
+            largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
+            avg_face_x = largest_face[0] + largest_face[2] // 2
+            avg_face_y = largest_face[1] + largest_face[3] // 2
             return avg_face_x, avg_face_y
-        return in_width // 2, in_height // 2
+        return None
 
-    # New: sample face centers at every 20% interval
+    # Sample face centers at every 20% interval
     import numpy as np
     sample_percentages = [0.2, 0.4, 0.6, 0.8]
     sample_times = [start_time + duration * p for p in sample_percentages]
-    samples = [get_face_center(t) for t in sample_times]
+    samples = [get_primary_face_center(t) for t in sample_times]
 
-    # Fit a linear trend for x and y coordinates over time
-    times_relative = np.array([t - start_time for t in sample_times])
-    centers_x = np.array([pt[0] for pt in samples])
-    centers_y = np.array([pt[1] for pt in samples])
-    a_x, b_x = np.polyfit(times_relative, centers_x, 1)
-    a_y, b_y = np.polyfit(times_relative, centers_y, 1)
+    # Filter out None values
+    samples = [s for s in samples if s is not None]
+
+    if not samples:
+        raise ValueError("No faces detected in the video segment.")
+
+    # Use the first detected face as the primary face
+    primary_face_x, primary_face_y = samples[0]
 
     # Helper lambda for clamping values.
     def clamp(x, lo, hi): return max(lo, min(x, hi))
 
-    # Determine dynamic crop expression based on video aspect.
+    # Determine crop rectangle based on primary face
     if (in_width / in_height) >= target_ratio:
         # Horizontal branch: crop width based on in_height.
         crop_width = int(in_height * target_ratio)
         crop_y = 0
-        # Expression: x position = (a_x*t + (b_x - crop_width/2))
-        x_expr = f'({a_x:.2f}*t+{(b_x - crop_width/2):.2f})'
-        y_expr = str(crop_y)
-        # Use dynamic x; y fixed.
+        crop_x = clamp(primary_face_x - crop_width // 2, 0, in_width - crop_width)
     else:
         # Vertical branch: crop height computed from in_width.
         crop_height = int(in_width * (16/9))
         crop_x = 0
-        # Expression: y position = (a_y*t + (b_y - crop_height/2))
-        y_expr = f'({a_y:.2f}*t+{(b_y - crop_height/2):.2f})'
-        x_expr = str(crop_x)
+        crop_y = clamp(primary_face_y - crop_height // 2, 0, in_height - crop_height)
 
     try:
         (
@@ -222,8 +219,8 @@ def detect_face_and_crop(video_path, output_path, start_time, end_time):
                         in_width/in_height) >= target_ratio else in_width,
                     h=crop_height if (
                         in_width/in_height) < target_ratio else in_height,
-                    x=x_expr,
-                    y=y_expr)
+                    x=crop_x,
+                    y=crop_y)
             .filter('scale', 1080, 1920)
             .output(output_path,
                     vcodec='libx264',
