@@ -2,8 +2,14 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from components.processing import process_video
 import os
 import threading
+import logging
 
 app = Flask(__name__)
+
+# Get the Werkzeug logger (which Flask uses)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)  # Suppress access logs (INFO and below)
+
 app.config['UPLOAD_FOLDER'] = 'uploads/'
 app.config['FINISHED_FOLDER'] = 'finished_videos/'
 app.config['TEMP_FOLDER'] = 'temp_files/'

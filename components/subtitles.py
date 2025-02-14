@@ -1,8 +1,7 @@
 import os
-import textwrap
 import ffmpeg
 import pysubs2
-from components.helpers import format_timestamp, get_video_duration
+from components.helpers import normalize_path, get_video_duration
 
 # Dynamically determine the path to the subscribe image
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,12 +11,29 @@ subscribe_img_path = os.path.join(PROJECT_DIR, "static", "assets", "youtube-subs
 # Create an ASS subtitle file.
 # ----------------------------------------------------------------------------
 
-def write_ass(subtitles, ass_file_path):
+def write_ass(subtitles, ass_file_path, video_path):
+    ass_file_path = normalize_path(ass_file_path)
+    
     subs = pysubs2.SSAFile()
-    subs.info['Title'] = "Styled Subtitles"
+    
+    # Set video resolution explicitly for portrait mode
+    width, height = 1080, 1920
+
+    # Set up required ASS script info
+    subs.info = {
+        'Title': 'Styled Subtitles',
+        'ScriptType': 'v4.00+',
+        'WrapStyle': '0',
+        'ScaledBorderAndShadow': 'yes',
+        'PlayResX': str(width),
+        'PlayResY': str(height),
+        'Collisions': 'Normal'
+    }
+
+    # Define the default style
     subs.styles['Default'] = pysubs2.SSAStyle(
         fontname="impact",
-        fontsize=18,
+        fontsize=80,
         primarycolor=pysubs2.Color(255, 255, 255),
         outlinecolor=pysubs2.Color(0, 0, 0),
         backcolor=pysubs2.Color(0, 0, 0, 100),
@@ -25,138 +41,148 @@ def write_ass(subtitles, ass_file_path):
         italic=0,
         underline=0,
         strikeout=0,
-        scalex=100,
-        scaley=100,
-        spacing=0,
+        scalex=100, # Adjust these to change font size
+        scaley=100, # Adjust these to change font size
+        spacing=0.8,
         angle=0,
         borderstyle=1,
-        outline=1,
-        shadow=0,
-        alignment=pysubs2.Alignment.BOTTOM_CENTER,
+        outline=2.5,
+        shadow=0.5,
+        alignment=2,  # 2 = bottom-center alignment
         marginl=10,
         marginr=10,
-        marginv=65,  # Move subtitles higher in the frame
+        marginv=500,  # Increase margin from bottom
         encoding=1
     )
 
-    for start, end, text in subtitles:
-        if end - start < 1.0:
-            end = start + 1.0
-        # Combine words into sentences
-        words = text.split()
-        # Highlight each word as it is spoken
-        highlighted_sentence = ''
-        for i, word in enumerate(words):
-            word_start = start + (end - start) * (i / len(words))
-            word_end = start + (end - start) * ((i + 1) / len(words))
-            highlighted_sentence += f"{{\\1c&H00FF00&\\fs24}}{word}{{\\r}} "
-            event = pysubs2.SSAEvent(
-                start=pysubs2.make_time(ms=word_start * 1000),
-                end=pysubs2.make_time(ms=word_end * 1000),
-                text=highlighted_sentence.strip()
-            )
-            subs.events.append(event)
+    print(f"Creating subtitles with {len(subtitles)} words")
+    
+    subtitles = sorted(subtitles, key=lambda x: x[0])
+    
+    for i, (word_start, word_end, current_word, sent_num) in enumerate(subtitles):
+        # Limit total words to show to 4 if possible
+        window = 4
+        if len(subtitles) <= window:
+            start_idx = 0
+            end_idx = len(subtitles)
+        else:
+            offset = (window - 1) // 2  # For window=4, offset will be 1
+            start_idx = max(0, i - offset)
+            if start_idx + window > len(subtitles):
+                start_idx = len(subtitles) - window
+            end_idx = start_idx + window
 
-    subs.save(ass_file_path)
+        # Define the color cycle: white, green, yellow.
+        # Red = &HFF0000&, Green = &H00FF00&, Yellow = &H00FFFF&
+        color_cycle = ["&HFF0000&", "&H00FF00&", "&H00FFFF&"]
+
+        highlighted_parts = ["{\\r}"]
+
+        for j in range(start_idx, end_idx):
+            word = subtitles[j][2].upper()
+            # Only highlight the current word.
+            if j == i:
+                color = color_cycle[j % len(color_cycle)]
+                highlighted_parts.append(f"{{\\1c{color}\\bord2.5\\shad0.5}}{word}{{\\r}}")
+            else:
+                highlighted_parts.append(word)
+
+        highlighted_text = " ".join(highlighted_parts)
+
+        if i == 0:
+            print(f"First subtitle: {highlighted_text}")
+            print(f"Time: {word_start:.2f} - {word_end:.2f}")
+
+        # Extend event display by 1 extra second (1000 ms) but ensure we don't overlap with next event
+        current_start_ms = word_start * 1000
+        current_end_ms = word_end * 1000
+        extended_end_ms = current_end_ms + 1000  # add 1 second
+        if i < len(subtitles) - 1:
+            next_start_ms = subtitles[i + 1][0] * 1000
+            extended_end_ms = min(extended_end_ms, next_start_ms)
+
+        event = pysubs2.SSAEvent(
+            start=pysubs2.make_time(ms=current_start_ms),
+            end=pysubs2.make_time(ms=extended_end_ms),
+            text=highlighted_text,
+            style='Default'
+        )
+        subs.events.append(event)
+
+    print(f"Generated {len(subs.events)} subtitle events")
+    print(f"Saving subtitles to: {ass_file_path}")
+    
+    # Save with explicit encoding
+    subs.save(ass_file_path, encoding='utf-8-sig')
+    
+    print("Subtitles saved successfully")
 
 # ----------------------------------------------------------------------------
 # Burn subtitles directly onto the video using ffmpeg.
 # ----------------------------------------------------------------------------
 
 def burn_subtitles(video_path, ass_path, output_path):
-    ass_path_fixed = ass_path.replace("\\", "/")
-
-    # ------------------------------------------------------------------------
-    # Step 1: Get video duration.
-    # ------------------------------------------------------------------------
-    video_duration = get_video_duration(video_path)
-    overlay_start = video_duration - 15.0  # Start overlay 15 seconds before end
-    print(
-        f"[DEBUG] Video duration: {video_duration}, overlay will start at: {overlay_start}")
-
-    # ------------------------------------------------------------------------
-    # Step 2: Define animated overlay parameters.
-    # ------------------------------------------------------------------------
-    # Increase the size of the overlay by 40%
-    scale = 1.4
-    scaled_width = f"iw*{scale}"
-    scaled_height = f"ih*{scale}"
-
-    # Align to the top right corner with a 10-pixel margin
-    x = f"main_w-overlay_w*{scale}-10"
-    y_static = 10
-
-    # Reduce the bounce by 30%
-    bounce_reduction = 0.7
-    bounce_amplitude = 100 * bounce_reduction
-
-    # Define the bounce animation
-    y = f"if(gte(t,{overlay_start}),if(lt(t,{overlay_start}+1),{y_static}-{bounce_amplitude}*sin(PI*(t-{overlay_start})),{y_static}),-overlay_h)"
-    print(f"[DEBUG] Using subscribe image file: {subscribe_img_path}")
-
-    # ------------------------------------------------------------------------
-    # Step 3: Combine subtitle burning and overlay in a single FFmpeg command.
-    # ------------------------------------------------------------------------
+    print(f"Starting subtitle burn process...")
+    print(f"Input video: {video_path}")
+    print(f"Subtitle file: {ass_path}")
+    print(f"Output path: {output_path}")
+    
+    # Normalize all paths to use forward slashes
+    video_path = normalize_path(video_path)
+    ass_path = normalize_path(ass_path)
+    output_path = normalize_path(output_path)
+    subscribe_img_path_fixed = normalize_path(subscribe_img_path)
+    
     try:
-        # Define the complex filtergraph
-        input_video = ffmpeg.input(video_path)
-        input_overlay = ffmpeg.input(subscribe_img_path)
+        # Get video duration for overlay timing
+        video_duration = get_video_duration(video_path)
+        overlay_start = video_duration - 15.0
+        print(f"Video duration: {video_duration}, overlay will start at: {overlay_start}")
 
-        # Subtitle filter
-        subtitles = input_video.filter(
-            'subtitles', ass_path_fixed
+        # Create input streams
+        video = ffmpeg.input(video_path)
+        overlay = ffmpeg.input(subscribe_img_path_fixed)
+
+        # Apply subtitle filter and overlay in one step
+        ass_video = video.filter('ass', filename=ass_path)
+        final_video = ffmpeg.overlay(
+            ass_video,
+            overlay,
+            x='main_w-overlay_w*1.4-10',
+            y=f"if(gte(t,{overlay_start}),if(lt(t,{overlay_start}+1),10-70*sin(PI*(t-{overlay_start})),10),10)",
+            enable=f"gte(t,{overlay_start}-1)"
         )
 
-        # Scale the overlay
-        scaled_overlay = input_overlay.filter(
-            'scale', w=scaled_width, h=scaled_height)
+        print("Starting FFmpeg process...")
+        
+        # Create the output with both video and audio
+        stream = ffmpeg.output(final_video, video.audio, output_path, acodec='copy', vcodec='libx264', preset='fast', crf=23, movflags='+faststart', threads=4)
 
-        # Overlay filter
-        overlay = subtitles.overlay(
-            scaled_overlay,
-            x=x,
-            y=y,
-            enable=f'gte(t,{overlay_start}-1)'
-        )
-
-        # Output
-        (
-            overlay
-            .output(output_path, vcodec='libx264', acodec='copy', map='0:a')
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-        print(
-            f"[DEBUG] Subtitles and overlay applied; output saved to: {output_path}")
+        # Run the ffmpeg command
+        #print(f"FFmpeg command: {stream.compile()}")  # Debug: print the FFmpeg command
+        stream.overwrite_output().run(capture_stdout=True, capture_stderr=True)
+        print(f"FFmpeg process completed.")  # Debug: print when FFmpeg process is completed
+        
+        print(f"Subtitles burned successfully, output saved to: {output_path}")
 
     except ffmpeg.Error as e:
         err = e.stderr.decode('utf-8') if e.stderr else "No stderr output."
-        print("[DEBUG] FFmpeg error during processing:", err)
+        print(f"FFmpeg error during subtitle burn: {err}")
         raise
 
-    # ------------------------------------------------------------------------
-    # Step 4: (Optional) Re-mux the final video to fix metadata issues.
-    # ------------------------------------------------------------------------
-    # For testing purposes, comment out the re-mux step until you verify the overlay.
-    # Sometimes remuxing with 'codec=copy' can discard changes applied during encoding.
-    remuxed_path = output_path.replace(".mp4", "_fixed.mp4")
+    # Re-mux the final video to fix any metadata issues if needed
     try:
+        remuxed_path = output_path.replace(".mp4", "_fixed.mp4")
         (
             ffmpeg
             .input(output_path)
-            .output(
-                remuxed_path,
-                codec="copy",
-                **{'map_metadata': '-1', 'movflags': '+faststart', 'reset_timestamps': '1'}
-            )
+            .output(remuxed_path, codec="copy", **{'map_metadata': '-1', 'movflags': '+faststart'})
             .overwrite_output()
             .run(capture_stdout=True, capture_stderr=True)
         )
-        import os
         os.replace(remuxed_path, output_path)
-        print("[DEBUG] Subtitled video metadata fixed by re-muxing.")
+        print("Video metadata fixed by re-muxing.")
     except ffmpeg.Error as e:
-        # This error will show if re-muxing fails.
         err = e.stderr.decode('utf-8') if e.stderr else "No stderr output."
-        print(f"[DEBUG] FFmpeg re-mux error (burn_subtitles): {err}")
-        # If re-muxing isn't required, you can comment this block out.
+        print(f"FFmpeg re-mux error: {err}")
+        # Continue even if re-muxing fails

@@ -1,36 +1,13 @@
 import os
 import shutil  # Import shutil for file operations
 from components.edits import extractAudio, detect_face_and_crop
-from components.helpers import get_file_hash, load_transcription_segments, find_best_chunks, find_sentence_start, find_sentence_end
-from components.transcriptions import transcribe_audio
+from components.helpers import get_file_hash
 from components.sentiment_analysis import analyze_emotions
 from components.subtitles import write_ass, burn_subtitles
-from moviepy.video.io.VideoFileClip import VideoFileClip
+from components.transcriptions import transcribe_audio
+from components.conversations import conversation_detection
 import sys
-
-def convert_to_sentence_level(word_segments):
-    sentence_segments = []
-    current_sentence = []
-    start_time = None
-    for word in word_segments:
-        if start_time is None:
-            start_time = word["timestamp"][0]
-        current_sentence.append(word["text"])
-        if word["text"].endswith(('.', '?', '!')):
-            end_time = word["timestamp"][1]
-            sentence_segments.append({
-                "timestamp": [start_time, end_time],
-                "text": ' '.join(current_sentence)
-            })
-            current_sentence = []
-            start_time = None
-    if current_sentence:
-        end_time = word_segments[-1]["timestamp"][1]
-        sentence_segments.append({
-            "timestamp": [start_time, end_time],
-            "text": ' '.join(current_sentence)
-        })
-    return sentence_segments
+import json
 
 def process_video(video_path, progress_dict, temp_dir, finished_dir):
     filename = os.path.basename(video_path)
@@ -49,96 +26,97 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         else:
             print(f"Video file already exists in temp_files, using existing file: {temp_file_path}")
 
-        print("Video Processing Has Begun...")
         progress_dict[filename] = {"progress": 5, "error": False}
 
         # Generate a hash for the video file
         file_hash = get_file_hash(temp_file_path)
-        audio_path = f"{temp_dir}/{file_hash}_audio.wav"
-        transcript_path = f"{temp_dir}/{file_hash}_transcript.txt"
-        emotion_path = f"{temp_dir}/{file_hash}_emotions.txt"
+        audio_path = os.path.join(temp_dir, f"{file_hash}_audio.wav")
+        transcript_path = os.path.join(temp_dir, f"{file_hash}_transcript.json")
 
-        print("Starting The Audio Processing...")
+        print("Starting The Audio Extraction Process...")
         progress_dict[filename] = {"progress": 10, "error": False}
 
-        try:
-            # Audio extraction with error handling
-            if not os.path.exists(audio_path):
-                with VideoFileClip(temp_file_path) as video:
-                    audio_path = extractAudio(temp_file_path, audio_path)
-                if audio_path is None:
-                    raise Exception("Audio extraction failed")
-                print("Audio Processing Was a Success...")
+        # Extract The Audio From The Video (temp_file_path)
+        if not os.path.exists(audio_path):
+            audio_path = extractAudio(temp_file_path, audio_path)
+                
+            if audio_path is None:
+                raise Exception("Audio Extraction Has Failed!")
             else:
-                print("Audio File Already Exists; Skipping Extraction...")
-        except Exception as e:
-            print(f"Error in audio extraction: {str(e)}")
-            progress_dict[filename] = {"progress": 0, "error": True}
-            raise
+                print("Audio Extraction Was a Success...")
+        else:
+            print("The Audio File Already Exists; Skipping Extraction...")
 
         progress_dict[filename] = {"progress": 25, "error": False}
 
-        print("Starting Audio Transcription Process...")
+        print("Preparing For Audio Transcription...")
 
-        word_segments = transcribe_audio(audio_path, transcript_path)
-        word_segments = load_transcription_segments(transcript_path)
-
-        # Convert word-level transcription to sentence-level transcription
-        sentence_segments = convert_to_sentence_level(word_segments)
+        transcription = transcribe_audio(audio_path, transcript_path)
 
         progress_dict[filename] = {"progress": 40, "error": False}
 
+        print("Starting Conversation Detection Process...")
+        conversations = conversation_detection(transcription)
+
+        # Save the conversation segments to a file for debugging as json
+        conversation_path = os.path.join(temp_dir, f"conversations.json")
+        with open(conversation_path, 'w') as f:
+            json.dump(conversations, f, indent=4)
+
+        print("Finished Conversation Detection...")
+
         print("Starting Sentiment Analysis Process...")
         try:
-            emotions = analyze_emotions(sentence_segments, emotion_path)
+            emotions = analyze_emotions(conversations)
             if not emotions:
-                raise Exception("Sentiment analysis failed or returned empty")
+                raise Exception("Sentiment Analysis Failed...")
         except Exception as e:
-            print(f"Error in sentiment analysis: {str(e)}")
+            print(f"Error in Sentiment Analysis: {str(e)}")
             progress_dict[filename] = {"progress": 0, "error": True}
             raise
 
+        # Save the conversation segments to a file for debugging as json
+        emotion_path = os.path.join(temp_dir, f"emotions.json")
+        with open(emotion_path, 'w') as f:
+            json.dump(emotions, f, indent=4)
+
+        print("Finished Sentiment Analysis Process...")
+
         progress_dict[filename] = {"progress": 60, "error": False}
 
-        # Find the best segments that are close to 59 seconds with highest emotional scores
-        best_chunks = find_best_chunks(emotions)
-        if not best_chunks:
-            print("No suitable segments found")
-            progress_dict[filename] = {"progress": 0, "error": True}
-            raise Exception("No suitable segments found")
-        
-        # print out the total best_chunks
-        print(f"Total best_chunks: {len(best_chunks)}")
+        # For each emotions segment, only keep the ones with a emotion_score > 0.5
+        interesting_segments = [seg for seg in emotions if seg["emotion_score"] > 0.5]
 
-        # Process top 3 non-overlapping segments
-        best_chunks = best_chunks[:1]
-
-        cropped_file = None
-        subtitled_file = None
-        ass_file = None
-
-        for chunk in best_chunks:
-            start_index, end_index, start_time, end_time = chunk
-            print(f"Processing chunk: Duration={end_time-start_time:.2f}s, Start={start_time:.2f}s, End={end_time:.2f}s")
+        # Initialize all transcript entries with conversation_id 0
+        for entry in transcription:
+            entry["conversation_id"] = "0"
+            entry_text = entry["text"].lower()
             
-            # Get word segments that fall within this chunk's time range, with a small buffer
-            buffer = 0.1  # 100ms buffer to catch nearby words
-            chunk_words = [
-                segment for segment in word_segments
-                if (segment["timestamp"][0] >= (start_time - buffer) and 
-                    segment["timestamp"][1] <= (end_time + buffer))
-            ]
-            
-            if not chunk_words:
-                print(f"No word segments found for chunk {start_time:.2f}-{end_time:.2f}")
-                continue
+            # Check if this transcript entry matches any interesting segment
+            for idx, segment in enumerate(interesting_segments, 1):
+                segment_text = segment["text"].lower()
+                if entry_text in segment_text or segment_text in entry_text:
+                    entry["conversation_id"] = str(idx)
+                    break  # Stop checking once we find a match
 
-            print(f"Extracting Clip From {start_time:.2f}s To {end_time:.2f}s.")
+        new_transcript_path = os.path.join(temp_dir, f"NEW-TRANSCRIPT.json")
+        with open(new_transcript_path, 'w') as f:
+            json.dump(transcription, f, indent=4)
+
+        print(f"Updated transcript with {len(interesting_segments)} potential conversation segments")
+
+        # Clamp this to 2 for now, remove it later on
+        interesting_segments = interesting_segments[:2]
+
+        # Process each interesting segment
+        for idx, segment in enumerate(interesting_segments, 1):
+            start_time = segment["start"]
+            end_time = segment["end"]
 
             progress_dict[filename] = {"progress": 65, "error": False}
 
-            cropped_file = f"{temp_dir}/{file_hash}_dramatic_clip_{start_time:.2f}_{end_time:.2f}.mp4"
-            subtitled_file = f"{temp_dir}/{file_hash}_dramatic_clip_with_subtitles_{start_time:.2f}_{end_time:.2f}.mp4"
+            cropped_file = os.path.join(temp_dir, f"{file_hash}_dramatic_clip_{start_time:.2f}_{end_time:.2f}.mp4")
+            subtitled_file = os.path.join(temp_dir, f"{file_hash}_dramatic_clip_with_subtitles_{start_time:.2f}_{end_time:.2f}.mp4")
 
             if not os.path.exists(cropped_file):
                 try:
@@ -152,18 +130,53 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
 
             progress_dict[filename] = {"progress": 80, "error": False}
 
-            # Create subtitles for the chunk using word-level segments
-            subtitles = [
-                (segment["timestamp"][0] - start_time, 
-                 segment["timestamp"][1] - start_time,
-                 segment["text"])
-                for segment in chunk_words
-            ]
+            # Create subtitles using only the transcription entries that match this conversation
+            subtitles = []
+            sentence_text = []
+            current_sentence = 0
+            last_end_time = None
+            
+            # Filter transcription entries that belong to this conversation
+            conversation_segments = [seg for seg in transcription if seg["conversation_id"] == str(idx)]
+            
+            for segment in conversation_segments:
+                # Loop through each word in the segment
+                for word_info in segment["words"]:
+                    current_word = word_info["word"].strip()
+                    # Adjust timestamps relative to the clip's start time
+                    word_start = word_info["start"] - start_time
+                    word_end = word_info["end"] - start_time
+                    
+                    # Only include words that fall within the clip's time range
+                    if word_start >= 0 and word_end <= (end_time - start_time):
+                        # Detect sentence boundaries
+                        ends_sentence = any(current_word.endswith(x) for x in ['.', '!', '?', '..."', '."', '!"', '?"'])
+                        
+                        # Check for significant pauses that might indicate sentence breaks
+                        if last_end_time is not None:
+                            time_gap = word_start - last_end_time
+                            if time_gap > 1.5:
+                                current_sentence += 1
+                                sentence_text = []
+                        
+                        sentence_text.append(current_word)
+                        subtitles.append((word_start, word_end, current_word, current_sentence))
+                        
+                        if ends_sentence:
+                            current_sentence += 1
+                            sentence_text = []
+                        
+                        last_end_time = word_end
 
-            ass_file = f"{temp_dir}/{file_hash}_subtitles_{start_time:.2f}_{end_time:.2f}.ass"
+            ass_file = os.path.join(temp_dir, f"{file_hash}_subtitles_{start_time:.2f}_{end_time:.2f}.ass")
             print("Starting Subtitle Generation...")
-            write_ass(subtitles, ass_file)
-            progress_dict[filename] = {"progress": 90, "error": False}
+            write_ass(subtitles, ass_file, cropped_file)
+
+            # Debug: Print the content of the generated ASS file
+            with open(ass_file, 'r', encoding='utf-8-sig') as f:
+                ass_content = f.read()
+                print("Generated ASS subtitle file content:")
+                print(ass_content)
 
             if not os.path.exists(subtitled_file):
                 burn_subtitles(cropped_file, ass_file, subtitled_file)

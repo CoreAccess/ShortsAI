@@ -181,7 +181,6 @@ def detect_face_and_crop(video_path, output_path, start_time, end_time):
         return None
 
     # Sample face centers at every 20% interval
-    import numpy as np
     sample_percentages = [0.2, 0.4, 0.6, 0.8]
     sample_times = [start_time + duration * p for p in sample_percentages]
     samples = [get_primary_face_center(t) for t in sample_times]
