@@ -1,12 +1,11 @@
 import os
-import shutil  # Import shutil for file operations
+import shutil
 from components.edits import extractAudio, detect_face_and_crop
 from components.helpers import get_file_hash
 from components.sentiment_analysis import analyze_emotions
 from components.subtitles import write_ass, burn_subtitles
 from components.transcriptions import transcribe_audio
 from components.conversations import conversation_detection
-import sys
 import json
 
 def process_video(video_path, progress_dict, temp_dir, finished_dir):
@@ -106,7 +105,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         print(f"Updated transcript with {len(interesting_segments)} potential conversation segments")
 
         # Clamp this to 2 for now, remove it later on
-        interesting_segments = interesting_segments[:2]
+        interesting_segments = interesting_segments[:1] 
 
         # Process each interesting segment
         for idx, segment in enumerate(interesting_segments, 1):
@@ -172,12 +171,6 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
             print("Starting Subtitle Generation...")
             write_ass(subtitles, ass_file, cropped_file)
 
-            # Debug: Print the content of the generated ASS file
-            with open(ass_file, 'r', encoding='utf-8-sig') as f:
-                ass_content = f.read()
-                print("Generated ASS subtitle file content:")
-                print(ass_content)
-
             if not os.path.exists(subtitled_file):
                 burn_subtitles(cropped_file, ass_file, subtitled_file)
                 print(f"Generated Clip With Subtitles At: {subtitled_file}")
@@ -193,20 +186,13 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
             shutil.copy2(subtitled_file, final_video_path)
             print(f"Moved final video to: {final_video_path}")
 
-            # Clean up temp files after all clips are created
-            temp_files = [audio_path, transcript_path, emotion_path, cropped_file, ass_file, subtitled_file]
-            for temp_file in temp_files:
-                if temp_file and os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    print(f"Deleted temporary file: {temp_file}")
-
         # Delete the original video from uploads
         if os.path.exists(video_path):
             os.remove(video_path)
             print(f"Deleted original video from uploads: {video_path}")
 
         progress_dict[filename] = {"progress": 100, "error": False}
-
+        
     except Exception as e:
         print(f"Fatal error in process_video: {str(e)}")
         progress_dict[filename] = {"progress": 0, "error": True}
@@ -214,11 +200,14 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         import traceback
         traceback.print_exc()
     finally:
-        # Clean up temporary files regardless of success or failure
-        if temp_file_path and os.path.exists(temp_file_path):
+        '''
+        # Loop through and delete all files in the temp_files folder
+        for file in os.listdir(temp_dir):
+            file_path = os.path.join(temp_dir, file)
             try:
-                os.remove(temp_file_path)
-                print(f"Temporary File Has Been Deleted From: {temp_file_path}")
-                print("Processing Completed Successfully! Go Watch The Clips!")
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
             except Exception as e:
-                print(f"Error cleaning up temp file: {str(e)}")
+                print(f"Error deleting file: {file_path}")
+                print(e)
+        '''

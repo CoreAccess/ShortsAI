@@ -1,43 +1,21 @@
 from flask import Flask, jsonify, render_template, request, send_from_directory
-from components.processing import process_video
-import os
-import threading
 import logging
+from classes.app import AppClass
 
 app = Flask(__name__)
 
 # Get the Werkzeug logger (which Flask uses)
 log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)  # Suppress access logs (INFO and below)
+
+# Suppress access logs (INFO and below)
+log.setLevel(logging.ERROR)  # Suppresses the HTTP request logs in the terminal
 
 app.config['UPLOAD_FOLDER'] = 'uploads/'
 app.config['FINISHED_FOLDER'] = 'finished_videos/'
 app.config['TEMP_FOLDER'] = 'temp_files/'
-processing_progress = {}
-
-def cleanup_progress_dict():
-    # Clean up completed or failed entries
-    to_remove = []
-    for filename, progress_data in processing_progress.items():
-        if progress_data["progress"] == 100 or (progress_data["progress"] == 0 and progress_data["error"]):
-            to_remove.append(filename)
-    
-    for filename in to_remove:
-        del processing_progress[filename]
-
-
-def init_app():
-    # Reset all app state on startup
-    global processing_progress
-    processing_progress = {}
-
-    # Create required directories if they don't exist
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    os.makedirs(app.config['FINISHED_FOLDER'], exist_ok=True)
-    os.makedirs(app.config['TEMP_FOLDER'], exist_ok=True)
 
 # Initialize the application
-init_app()
+my_class = AppClass( app )
 
 @app.route('/')
 def index():
@@ -45,138 +23,34 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    files = request.files.getlist('file')
-
-    # Allowed video extensions
-    allowed_extensions = {'mp4', 'mkv', 'avi', 'mov'}
-
-    for file in files:
-        file_extension = file.filename.split('.')[-1].lower()
-        if file_extension not in allowed_extensions:
-            return jsonify({'error': f'File type not allowed: {file.filename}'}), 400
-        file_path = os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], file.filename))
-        if os.path.exists(file_path):
-            print(f'Skipping file {file.filename} as it already exists.')
-            continue
-        file.save(file_path)
-
-    return jsonify({'message': 'Upload complete'})
+    return my_class.upload()
 
 @app.route('/begin-processing', methods=['POST'])
 def begin_processing():
-    try:
-        # Don't start if there's already a video being processed
-        if any(progress.get("progress", 0) > 0 and progress.get("progress", 0) < 100 
-               for progress in processing_progress.values()):
-            return jsonify({'error': 'A video is already being processed'}), 409
-        
-        # Clean up old entries
-        cleanup_progress_dict()
-        
-        def process_next_video():
-            with app.app_context():
-                for filename in os.listdir(app.config['UPLOAD_FOLDER']): 
-                    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                    if os.path.isfile(file_path) and filename.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
-                        if filename in processing_progress:
-                            continue
-                            
-                        filepath = os.path.abspath(file_path)
-                        processing_progress[filename] = {"progress": 0, "error": False}
-
-                        def process_video_with_monitoring(*args):
-                            try:
-                                process_video(*args)
-                            except Exception as e:
-                                print(f"Unhandled exception in processing thread: {str(e)}")
-                            finally:
-                                process_next_video()  # Process the next video after the current one finishes
-                        
-                        thread = threading.Thread(target=process_video_with_monitoring, args=(
-                            filepath, 
-                            processing_progress,
-                            app.config['TEMP_FOLDER'],
-                            app.config['FINISHED_FOLDER']
-                        ))
-                        thread.daemon = True
-                        thread.start()
-                        
-                        return jsonify({'status': 'Processing started', 'filename': filename})
-                return jsonify({'error': 'No files available for processing'}), 404
-        
-        return process_next_video()
-    except Exception as e:
-        return jsonify({'error': 'Internal server error'}), 500
+    return my_class.begin_processing()
 
 @app.route('/processing-progress/<filename>')
 def get_processing_progress(filename):
-    # Only return progress for files that have explicitly started processing
-    if filename not in processing_progress:
-        return jsonify({"progress": 0, "error": False, "status": "ready"})
-        
-    # Check if file still exists in uploads folder
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    if not os.path.exists(file_path):
-        # If file doesn't exist but we have progress data showing it completed
-        progress_data = processing_progress.get(filename, {})
-        if progress_data.get('progress') == 100:
-            cleanup_progress_dict()  # Clean up the progress dictionary
-            return jsonify({"progress": 100, "error": False, "status": "completed"})
-        # If file doesn't exist and wasn't completed, it may have failed
-        cleanup_progress_dict()
-        return jsonify({"progress": 0, "error": True, "status": "failed"})
-    
-    # Return normal progress if file still exists
-    progress_data = processing_progress.get(filename, {"progress": 0, "error": False})
-    return jsonify(progress_data)
+    return my_class.get_processing_progress(filename)
 
 @app.route('/view/<filename>')
 def view_results(filename):
-    # Get the results for the processed file
-    filepath = os.path.abspath(os.path.join(os.getcwd(), app.config['UPLOAD_FOLDER'], filename))
-    results_file = filepath + '.results.json'
-    
-    if not os.path.exists(results_file):
-        return jsonify({'error': 'Results not found'}), 404
-        
-    with open(results_file, 'r') as f:
-        results = f.read()
-    
+    results = my_class.view_results(filename)
+
     return render_template('results.html', filename=filename, results=results)
 
 @app.route('/files', methods=['GET'])
 def list_files():
-    # Don't trigger any processing, just list files
-    files = []
-    for filename in os.listdir(app.config['UPLOAD_FOLDER']):
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        if os.path.isfile(file_path):
-            # Include all files that aren't currently being processed
-            if filename not in processing_progress:
-                files.append({
-                    'name': filename,
-                    'size': os.path.getsize(file_path),
-                    'status': 'ready'
-                })
-    return jsonify(files)
+    return my_class.list_files()
 
 @app.route('/results')
 def results():
-    # Get list of finished videos
-    finished_videos = []
-    for filename in os.listdir(app.config['FINISHED_FOLDER']):
-        if filename.endswith('.mp4'):  # Only include mp4 files
-            file_path = os.path.join(app.config['FINISHED_FOLDER'], filename)
-            file_size = os.path.getsize(file_path)
-            finished_videos.append({
-                'name': filename,
-                'size': file_size,
-                'path': f'/video/{filename}'
-            })
+    finished_videos = my_class.results()
     
     # If it's an AJAX request, return just the count
     if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         return jsonify({'count': len(finished_videos)})
+    
     return render_template('results.html', videos=finished_videos)
 
 @app.route('/video/<filename>')
@@ -189,14 +63,6 @@ def favicon():
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    """Handle any unhandled exception without crashing the server"""
-    # If this is a background thread error, update progress
-    thread_name = threading.current_thread().name
-    if thread_name != "MainThread":
-        for filename, progress in processing_progress.items():
-            if progress.get("progress", 0) > 0 and progress.get("progress", 0) < 100:
-                processing_progress[filename] = {"progress": 0, "error": True}
-    
     # Return error response
     return jsonify({
         "error": "An internal server error occurred",

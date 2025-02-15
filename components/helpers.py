@@ -1,5 +1,4 @@
 import hashlib
-import cv2
 import json
 import subprocess
 
@@ -94,19 +93,6 @@ def chunk_text_with_timestamps(transcription_segments, max_length=192):
 
     # Return the list of text chunks
     return chunks
-
-# ---------------------------------------------------------------
-# Crop a single video frame to a 9:16 aspect ratio.
-# ---------------------------------------------------------------
-
-
-def crop_frame(frame, left, right, target_width, width, height):
-
-    # Crop the frame horizontally
-    cropped_frame = frame[:, int(left):int(right)]
-
-    # Resize the cropped frame to the target dimensions (1080x1920)
-    return cv2.resize(cropped_frame, (1080, 1920))
 
 # ---------------------------------------------------------------
 # Write emotion analysis data to file.

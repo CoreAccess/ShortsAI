@@ -60,7 +60,7 @@ def write_ass(subtitles, ass_file_path, video_path):
     subtitles = sorted(subtitles, key=lambda x: x[0])
     
     for i, (word_start, word_end, current_word, sent_num) in enumerate(subtitles):
-        # Limit total words to show to 4 if possible
+        # Display 4 words at a time
         window = 4
         if len(subtitles) <= window:
             start_idx = 0
@@ -76,14 +76,14 @@ def write_ass(subtitles, ass_file_path, video_path):
         # Red = &HFF0000&, Green = &H00FF00&, Yellow = &H00FFFF&
         color_cycle = ["&HFF0000&", "&H00FF00&", "&H00FFFF&"]
 
-        highlighted_parts = ["{\\r}"]
+        highlighted_parts = []
 
         for j in range(start_idx, end_idx):
             word = subtitles[j][2].upper()
             # Only highlight the current word.
             if j == i:
                 color = color_cycle[j % len(color_cycle)]
-                highlighted_parts.append(f"{{\\1c{color}\\bord2.5\\shad0.5}}{word}{{\\r}}")
+                highlighted_parts.append(f"{{\\1c{color}\\bord2.5\\shad0.5}}{word}\r")
             else:
                 highlighted_parts.append(word)
 
@@ -104,12 +104,12 @@ def write_ass(subtitles, ass_file_path, video_path):
         event = pysubs2.SSAEvent(
             start=pysubs2.make_time(ms=current_start_ms),
             end=pysubs2.make_time(ms=extended_end_ms),
-            text=highlighted_text,
+            text=f"{highlighted_text} ({current_word})",
             style='Default'
         )
         subs.events.append(event)
 
-    print(f"Generated {len(subs.events)} subtitle events")
+    #print(f"Generated {len(subs.events)} subtitle events")
     print(f"Saving subtitles to: {ass_file_path}")
     
     # Save with explicit encoding
@@ -155,8 +155,15 @@ def burn_subtitles(video_path, ass_path, output_path):
 
         print("Starting FFmpeg process...")
         
-        # Create the output with both video and audio
-        stream = ffmpeg.output(final_video, video.audio, output_path, acodec='copy', vcodec='libx264', preset='fast', crf=23, movflags='+faststart', threads=4)
+        # Check if the input video has an audio stream
+        probe = ffmpeg.probe(video_path)
+        has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
+
+        # Create the output with both video and audio if audio stream exists
+        if has_audio:
+            stream = ffmpeg.output(final_video, video.audio, output_path, acodec='copy', vcodec='libx264', preset='fast', crf=23, movflags='+faststart', threads=4)
+        else:
+            stream = ffmpeg.output(final_video, output_path, vcodec='libx264', preset='fast', crf=23, movflags='+faststart', threads=4)
 
         # Run the ffmpeg command
         #print(f"FFmpeg command: {stream.compile()}")  # Debug: print the FFmpeg command
@@ -164,7 +171,7 @@ def burn_subtitles(video_path, ass_path, output_path):
         print(f"FFmpeg process completed.")  # Debug: print when FFmpeg process is completed
         
         print(f"Subtitles burned successfully, output saved to: {output_path}")
-
+ 
     except ffmpeg.Error as e:
         err = e.stderr.decode('utf-8') if e.stderr else "No stderr output."
         print(f"FFmpeg error during subtitle burn: {err}")

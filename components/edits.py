@@ -1,7 +1,38 @@
 import cv2
-import numpy as np
 import ffmpeg
 import os
+import tempfile
+import torch
+import gc
+from facenet_pytorch import MTCNN
+import numpy as np
+
+# Check if CUDA is available and user hasn't disabled it
+use_cuda = torch.cuda.is_available()
+device = torch.device('cuda:0' if use_cuda else 'cpu')
+print(f"MTCNN Using device: {device}")
+
+# Initialize MTCNN with explicit device placement and batching
+mtcnn = MTCNN(
+    keep_all=True,
+    device=device,
+    select_largest=True,
+    min_face_size=20,
+    thresholds=[0.6, 0.7, 0.7],
+    post_process=True,
+    image_size=160,
+    margin=0,  # No margin to avoid unnecessary padding
+    selection_method='probability'  # Use probability-based selection
+).to(device)  # Ensure model is on the correct device
+
+def prepare_frame(frame):
+    """Convert frame to RGB for PyTorch processing"""
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if use_cuda:
+        # Clear CUDA cache periodically
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return frame_rgb
 
 # ----------------------------------------------------------------------------
 # Extract audio from a video file
@@ -91,17 +122,6 @@ def get_video_dimensions(video_path):
         return None, None
 
 # ----------------------------------------------------------------------------
-# Helper function to detect faces in a frame
-# ----------------------------------------------------------------------------
-
-
-def detect_faces(frame, face_cascade):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    return faces
-
-# ----------------------------------------------------------------------------
 # Helper function to calculate the center of a face
 # ----------------------------------------------------------------------------
 
@@ -144,112 +164,244 @@ def generate_tween_frames(start_rect, end_rect, num_frames):
     return frames
 
 # ----------------------------------------------------------------------------
+# Helper function to interpolate between two positions
+# ----------------------------------------------------------------------------
+
+
+def interpolate_position(pos1, pos2, t):
+    """Smooth interpolation between two positions using improved ease-in-out."""
+    # Quintic ease-in-out for smoother transitions
+    t = t * t * t * (t * (t * 6 - 15) + 10)
+    return pos1 + (pos2 - pos1) * t
+
+# ----------------------------------------------------------------------------
+# Helper function to interpolate between two positions using cubic easing
+# ----------------------------------------------------------------------------
+
+
+def smooth_interpolate(pos1, pos2, t):
+    """Smoother interpolation using cubic easing."""
+    # Improved cubic bezier curve
+    t2 = t * t
+    t3 = t2 * t
+    # Use a more gradual curve for smoother motion
+    return pos1 * (1 - t3) + pos2 * t3
+
+# ----------------------------------------------------------------------------
 # Detect a face in a video and crop the video around the face
 # ----------------------------------------------------------------------------
 
 
 def detect_face_and_crop(video_path, output_path, start_time, end_time):
-    # Calculate overall video dimensions.
-    in_width, in_height = get_video_dimensions(video_path)
-    if not in_width or not in_height:
-        raise ValueError("Could not determine video dimensions.")
-
-    duration = end_time - start_time
-    target_ratio = 9 / 16
-
-    # Initialize face cascade.
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-    # Helper: detect the primary face center at a given time.
-    def get_primary_face_center(time_sec):
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_MSEC, time_sec * 1000)
-        ret, frame = cap.read()
-        cap.release()
-        if ret:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-            if len(faces) == 0:
-                return None
-            # Focus on the largest face
-            largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
-            avg_face_x = largest_face[0] + largest_face[2] // 2
-            avg_face_y = largest_face[1] + largest_face[3] // 2
-            return avg_face_x, avg_face_y
-        return None
-
-    # Sample face centers at every 20% interval
-    sample_percentages = [0.2, 0.4, 0.6, 0.8]
-    sample_times = [start_time + duration * p for p in sample_percentages]
-    samples = [get_primary_face_center(t) for t in sample_times]
-
-    # Filter out None values
-    samples = [s for s in samples if s is not None]
-
-    if not samples:
-        raise ValueError("No faces detected in the video segment.")
-
-    # Use the first detected face as the primary face
-    primary_face_x, primary_face_y = samples[0]
-
-    # Helper lambda for clamping values.
-    def clamp(x, lo, hi): return max(lo, min(x, hi))
-
-    # Determine crop rectangle based on primary face
-    if (in_width / in_height) >= target_ratio:
-        # Horizontal branch: crop width based on in_height.
-        crop_width = int(in_height * target_ratio)
-        crop_y = 0
-        crop_x = clamp(primary_face_x - crop_width // 2, 0, in_width - crop_width)
-    else:
-        # Vertical branch: crop height computed from in_width.
-        crop_height = int(in_width * (16/9))
-        crop_x = 0
-        crop_y = clamp(primary_face_y - crop_height // 2, 0, in_height - crop_height)
-
     try:
-        (
-            ffmpeg
-            .input(video_path, ss=start_time, to=end_time)
-            .filter('crop',
-                    w=crop_width if (
-                        in_width/in_height) >= target_ratio else in_width,
-                    h=crop_height if (
-                        in_width/in_height) < target_ratio else in_height,
-                    x=crop_x,
-                    y=crop_y)
-            .filter('scale', 1080, 1920)
-            .output(output_path,
-                    vcodec='libx264',
-                    acodec='aac',
-                    audio_bitrate='192k',
-                    preset='fast', crf=23,
-                    **{'map': '0:a?'}
-            )
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-        print(f"Cropped video saved to: {output_path}")
+        # Validate duration and adjust times
+        probe = ffmpeg.probe(video_path) 
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        total_duration = float(probe['format']['duration'])
+        start_time = max(0, min(float(start_time), total_duration))
+        end_time = max(start_time, min(float(end_time), total_duration))
+        duration = end_time - start_time
+        if duration <= 0:
+            raise ValueError("Invalid duration: end_time must be greater than start_time")
+        if duration > 59.5:
+            raise ValueError("Video duration cannot exceed 59.5 seconds")
+        
+        # Get video dimensions and frame rate
+        in_width = int(video_info['width'])
+        in_height = int(video_info['height'])
+        fps = eval(video_info['r_frame_rate'])
+    
     except ffmpeg.Error as e:
-        print(f"FFmpeg error: {e.stderr.decode('utf-8')}")
+        print(f"Error probing video file: {str(e)}")
+        raise
+    except Exception as e:
+        print(f"Error validating video parameters: {str(e)}")
         raise
 
-    # Re-mux the file to fix metadata using additional flags (reset timestamps)
-    remuxed_path = output_path.replace(".mp4", "_fixed.mp4")
-    try:
-        (
-            ffmpeg
-            .input(output_path)
-            .output(remuxed_path,
-                    codec="copy",
-                    **{'map_metadata': '-1', 'movflags': '+faststart', 'reset_timestamps': '1'})
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-        os.replace(remuxed_path, output_path)
-        print("Video metadata fixed by resetting timestamps via re-mux.")
-    except ffmpeg.Error as e:
-        print(
-            f"FFmpeg re-mux error (reset timestamps): {e.stderr.decode('utf-8')}")
+    # Define buffer time and calculate buffered clip times
+    buffer_time = 2  # seconds
+    buffered_start = max(0, start_time - buffer_time)
+    buffered_end = min(total_duration, end_time + buffer_time)
+    buffered_duration = buffered_end - buffered_start
+
+    # Process using a temporary buffered video clip
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Extract temporary buffered clip
+        temp_clip = os.path.join(temp_dir, 'temp_clip.mp4')
+        try:
+            (
+                ffmpeg
+                .input(video_path, ss=buffered_start, t=buffered_duration)
+                .output(temp_clip, codec='copy')
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            )
+        except ffmpeg.Error as e:
+            print(f"Error extracting temporary clip: {e.stderr.decode('utf-8')}")
+            raise
+
+        # Adjust relative start time for the buffered clip
+        rel_start_time = start_time - buffered_start
+
+        # Initialize video capture on the temporary clip
+        cap = cv2.VideoCapture(temp_clip)
+        positions = []
+        last_valid_crop = None
+        crop_width = int(in_height * (9/16))
+        crop_height = in_height
+        batch_size = 4 if use_cuda else 1  # Process multiple frames at once if using GPU
+
+        frame_count = 0
+        frames_batch = []
+        try:
+            while cap.isOpened():
+                frames_batch.clear()
+                # Read batch_size frames
+                for _ in range(batch_size):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frames_batch.append(prepare_frame(frame))
+                
+                if not frames_batch:
+                    break
+
+                frame_count += len(frames_batch)
+                if frame_count % 100 == 0:
+                    print(f"Processing frame {frame_count}")
+                    # Force garbage collection periodically
+                    gc.collect()
+                    if use_cuda:
+                        torch.cuda.empty_cache()
+
+                # Process batch of frames
+                with torch.no_grad():
+                    if len(frames_batch) == batch_size:
+                        batch_boxes, _ = mtcnn.detect(frames_batch)
+                    else:
+                        batch_boxes = []
+                        for frame in frames_batch:
+                            boxes, _ = mtcnn.detect(frame)
+                            batch_boxes.append(boxes)
+
+                # Process each frame's detection results
+                for boxes in (batch_boxes if isinstance(batch_boxes, list) else [boxes for boxes in batch_boxes]):
+                    if boxes is not None and len(boxes) > 0:
+                        if isinstance(boxes, torch.Tensor):
+                            boxes = boxes.detach().cpu().numpy()
+                        
+                        valid_boxes = []
+                        for box in boxes:
+                            try:
+                                box_arr = np.array(box, dtype=np.float32)
+                            except Exception as e:
+                                continue
+                            if not (np.isnan(box_arr).any() or np.isinf(box_arr).any()):
+                                valid_boxes.append(box)
+                        
+                        if valid_boxes:
+                            valid_boxes.sort(key=lambda x: (x[2] - x[0]) * (x[3] - x[1]), reverse=True)
+                            best_box = valid_boxes[0]
+                            x1, y1, x2, y2 = best_box
+                            w = x2 - x1
+                            h = y2 - y1
+                            face_center_x = x1 + w/2
+
+                            best_x = max(0, min(face_center_x - crop_width/2, in_width - crop_width))
+                            if last_valid_crop:
+                                max_movement = crop_width * 0.015
+                                delta_x = best_x - last_valid_crop[0]
+                                if abs(delta_x) > max_movement:
+                                    best_x = last_valid_crop[0] + (max_movement if delta_x > 0 else -max_movement)
+                            last_valid_crop = (best_x, 0)
+                            positions.append((best_x, 0, crop_width, crop_height))
+                        else:
+                            crop_x = last_valid_crop[0] if last_valid_crop else (in_width - crop_width) // 2
+                            positions.append((crop_x, 0, crop_width, crop_height))
+                    else:
+                        crop_x = last_valid_crop[0] if last_valid_crop else (in_width - crop_width) // 2
+                        positions.append((crop_x, 0, crop_width, crop_height))
+        finally:
+            cap.release()
+            if use_cuda:
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        print(f"Total frames processed: {frame_count}")
+
+        # Smooth transitions between positions
+        smoothed_positions = []
+        for i in range(len(positions) - 1):
+            start_pos = positions[i]
+            end_pos = positions[i + 1]
+            smoothed_positions.extend(generate_tween_frames(start_pos, end_pos, int(fps)))
+        smoothed_positions.append(positions[-1])
+
+        # Process buffered clip with detected positions
+        try:
+            # Extract audio from the temporary clip relative to the desired start time
+            audio_file = os.path.join(temp_dir, 'audio.aac')
+            (
+                ffmpeg
+                .input(temp_clip, ss=rel_start_time, t=duration)
+                .output(audio_file, acodec='aac', audio_bitrate='192k')
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            )
+
+            segments = []
+            segment_duration = duration / len(smoothed_positions)
+
+            for i, (crop_x, crop_y, crop_width, crop_height) in enumerate(smoothed_positions):
+                # Adjust segment start relative to the buffered clip
+                segment_start = rel_start_time + (i * segment_duration)
+                segment_path = os.path.join(temp_dir, f'segment_{i:03d}.mp4')
+                segments.append(segment_path)
+
+                try:
+                    (
+                        ffmpeg
+                        .input(temp_clip, ss=segment_start, t=segment_duration)
+                        .filter('crop', crop_width, crop_height, crop_x, crop_y)
+                        .filter('setpts', 'PTS-STARTPTS')
+                        .filter('fps', fps=fps, round='up')
+                        .filter('scale', 1080, 1920)
+                        .output(segment_path, vcodec='libx264', crf=23, preset='fast', r=fps)
+                        .overwrite_output()
+                        .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                    )
+                except ffmpeg.Error as e:
+                    print(f"Error processing segment {i}: {e.stderr.decode('utf-8')}")
+                    raise
+
+            list_file = os.path.join(temp_dir, 'segments.txt')
+            with open(list_file, 'w') as f:
+                for segment in segments:
+                    f.write(f"file '{os.path.abspath(segment)}'\n")
+
+            video_file = os.path.join(temp_dir, 'video.mp4')
+            (
+                ffmpeg
+                .input(list_file, format='concat', safe=0)
+                .output(video_file, c='copy')
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            )
+
+            video_in = ffmpeg.input(video_file)
+            audio_in = ffmpeg.input(audio_file)
+            (
+                ffmpeg
+                .output(video_in, audio_in, output_path, vcodec='copy', acodec='copy', movflags='+faststart', r=fps)
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            )
+
+        except ffmpeg.Error as e:
+            print(f"Error processing video: {e.stderr.decode('utf-8')}")
+            raise
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            raise
+
+        print(f"Successfully created video: {output_path}")

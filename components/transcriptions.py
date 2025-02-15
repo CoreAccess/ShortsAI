@@ -27,8 +27,8 @@ def transcribe_audio(audio_path, transcript_path):
                 language="en",
                 temperature=0.0,
                 condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+                #vad_filter=True,
+                #vad_parameters=dict(min_silence_duration_ms=500),
                 word_timestamps=True
             )
 
