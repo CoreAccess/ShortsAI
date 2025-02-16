@@ -14,7 +14,7 @@ subscribe_img_path = os.path.join(PROJECT_DIR, "static", "assets", "youtube-subs
 def write_ass(subtitles, ass_file_path, video_path):
     ass_file_path = normalize_path(ass_file_path)
     
-    subs = pysubs2.SSAFile()
+    subs = pysubs2.SSAFile() 
     
     # Set video resolution explicitly for portrait mode
     width, height = 1080, 1920

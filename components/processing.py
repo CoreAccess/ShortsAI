@@ -124,8 +124,14 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
                 except ValueError as e:
                     print(f"No faces detected in the video segment: {str(e)}")
                     continue
-            else: 
+            else:
                 print(f"Clip Already Exists Using: {cropped_file}")
+
+            # Debugging statement to check if the cropped file exists
+            if os.path.exists(cropped_file):
+                print(f"Cropped file exists: {cropped_file}")
+            else:
+                print(f"Cropped file does not exist: {cropped_file}")
 
             progress_dict[filename] = {"progress": 80, "error": False}
 
@@ -172,8 +178,12 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
             write_ass(subtitles, ass_file, cropped_file)
 
             if not os.path.exists(subtitled_file):
-                burn_subtitles(cropped_file, ass_file, subtitled_file)
-                print(f"Generated Clip With Subtitles At: {subtitled_file}")
+                # Check if the cropped file exists before burning subtitles
+                if os.path.exists(cropped_file):
+                    burn_subtitles(cropped_file, ass_file, subtitled_file)
+                    print(f"Generated Clip With Subtitles At: {subtitled_file}")
+                else:
+                    print(f"Cropped file does not exist before burning subtitles: {cropped_file}")
             else:
                 print(f"Existing Clip Already Exists Using: {subtitled_file}")
 
