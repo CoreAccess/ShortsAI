@@ -7,3 +7,6 @@ facenet-pytorch==2.5.3
 transformers
 datasets
 psutil
+mediapipe
+pydub
+webrtcvad

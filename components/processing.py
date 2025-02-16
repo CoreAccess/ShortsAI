@@ -105,7 +105,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         print(f"Updated transcript with {len(interesting_segments)} potential conversation segments")
 
         # Clamp this to 2 for now, remove it later on
-        #interesting_segments = interesting_segments[:1] 
+        interesting_segments = interesting_segments[:1] 
 
         # Process each interesting segment
         for idx, segment in enumerate(interesting_segments, 1):

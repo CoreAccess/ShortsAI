@@ -13,12 +13,20 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 import mediapipe as mp
 import numpy as np
 import librosa
+import wave
+import contextlib
+from pydub import AudioSegment
 
-# Check if CUDA is available and user hasn't disabled it
+# Check if CUDA is available
 use_cuda = torch.cuda.is_available()
 device = torch.device('cuda:0' if use_cuda else 'cpu')
 
-# Removed: dlib landmark_predictor initialization since it isn't used
+# Initialize MediaPipe face detection
+mp_face_detection = mp.solutions.face_detection
+face_detector_mp = None
+
+# Global frames storage for face tracking
+Frames = []
 
 def prepare_frame(frame):
     """Convert frame to RGB for PyTorch processing"""
@@ -36,864 +44,520 @@ def prepare_frame(frame):
 
 def extractAudio(video_path, audio_path):
     try:
-        ffmpeg.input(video_path).output(
-            audio_path, acodec='libmp3lame', ar=44100, ac=2
-        ).run(capture_stdout=True, capture_stderr=True)
-        print(f"Audio Extracted To: {audio_path}")
+        temp_files_dir = os.path.dirname(audio_path)
+        print(f"Extracting audio to temp_files directory: {temp_files_dir}")
+        
+        audio = AudioSegment.from_file(video_path)
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        audio.export(audio_path, format="wav")
+        print(f"Audio extracted successfully to: {audio_path}")
         return audio_path
-    except ffmpeg.Error as e:
-        print(f"FFMPEG Error: {e.stderr.decode('utf-8')}")
-        return None
     except Exception as e:
         print(f"An Error Occurred While Extracting Audio: {e}")
         return None
 
-# ----------------------------------------------------------------------------
-# Crop a video file to a 9:16 aspect ratio (portrait) then scale to 1080x1920
-# ----------------------------------------------------------------------------
+def process_audio_frame(audio_data, sample_rate=16000, frame_duration_ms=30):
+    n = int(sample_rate * frame_duration_ms / 1000) * 2
+    offset = 0
+    while offset + n <= len(audio_data):
+        frame = audio_data[offset:offset + n]
+        offset += n
+        yield frame
 
+class FaceTracker:
+    def __init__(self, frame_width, frame_height, vertical_width):
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.vertical_width = vertical_width
+        self.history_size = 45  # Increased for smoother transitions (1.5 seconds at 30fps)
+        self.position_history = deque(maxlen=self.history_size)
+        self.face_history = deque(maxlen=self.history_size)
+        self.no_face_counter = 0
+        self.max_no_face_frames = 60  # 2 seconds at 30fps
+        self.last_valid_position = None
+        self.center_position = (frame_width - vertical_width) // 2
+        self.confidence_threshold = 0.85  # Increased confidence threshold
+        self.movement_smoothing = 0.7  # Higher value = smoother movement
+        self.speaker_bonus = 1.5  # Multiplier for speaker detection score
 
-def crop_video(input_file, output_file, start_time, end_time):
-    try:
-        # Get input video dimensions
-        probe = ffmpeg.probe(input_file)
-        video_stream = next(
-            s for s in probe['streams'] if s['codec_type'] == 'video')
-        in_width = int(video_stream['width'])
-        in_height = int(video_stream['height'])
+    def update(self, faces, is_speaking=False):
+        if not faces:
+            self.no_face_counter += 1
+            if self.no_face_counter >= self.max_no_face_frames:
+                if self.last_valid_position is not None:
+                    # More gradual transition to center
+                    alpha = min(1.0, (self.no_face_counter - self.max_no_face_frames) / 45)
+                    position = int(self.last_valid_position * (1 - alpha) + self.center_position * alpha)
+                else:
+                    position = self.center_position
+                self.position_history.append(position)
+                return position
+            elif self.last_valid_position is not None:
+                self.position_history.append(self.last_valid_position)
+                return self.last_valid_position
+            else:
+                self.position_history.append(self.center_position)
+                return self.center_position
 
-        # Calculate the duration of the subclip
-        duration = end_time - start_time
+        self.no_face_counter = 0
 
-        # Calculate dimensions maintaining 9:16 aspect ratio
-        # Use the input height as reference and calculate the appropriate width
-        output_height = in_height
-        output_width = int(output_height * (9/16))
+        # Find the most prominent face with speaker detection
+        best_face = None
+        best_score = -1
 
-        # Calculate the crop dimensions
-        crop_width = output_width
-        crop_height = output_height
+        for face in faces:
+            x, y, w, h = face
+            center_x = x + w/2
+            
+            # Size score (prefer larger faces)
+            size_score = (w * h) / (self.frame_width * self.frame_height)
+            
+            # Center score (prefer faces closer to center)
+            center_offset = abs(center_x - self.frame_width/2)
+            center_score = 1 - (center_offset / (self.frame_width/2))
+            
+            # Vertical position score (prefer faces in upper third)
+            vertical_score = 1 - (y / self.frame_height)
+            
+            # Combine scores with weights
+            score = (
+                size_score * 0.4 +
+                center_score * 0.4 +
+                vertical_score * 0.2
+            )
+            
+            # Apply speaker bonus if detected
+            if is_speaking:
+                score *= self.speaker_bonus
+            
+            if score > best_score:
+                best_score = score
+                best_face = face
 
-        # Calculate the x offset to center the crop
-        x_offset = (in_width - crop_width) // 2
+        if best_score < 0.3:  # Strict minimum score threshold
+            if self.last_valid_position is not None:
+                return self.last_valid_position
+            return self.center_position
 
-        # Build the ffmpeg command for cropping and resizing
-        ffmpeg_command = (
-            ffmpeg
-            .input(input_file, ss=start_time, t=duration)
-            .filter('crop', w=crop_width, h=crop_height, x=x_offset, y=0)
-            .output(output_file, codec='libx264', preset='fast', crf=23)
-            .overwrite_output()
+        x, y, w, h = best_face
+        face_center = x + w/2
+
+        # Calculate crop position ensuring face is well within frame
+        margin = w * 0.3  # 30% margin on each side of face
+        crop_x = max(0, min(self.frame_width - self.vertical_width,
+                           face_center - self.vertical_width/2))
+        
+        # Ensure face isn't too close to crop edges
+        if x - margin < crop_x:
+            crop_x = max(0, x - margin)
+        elif (x + w + margin) > (crop_x + self.vertical_width):
+            crop_x = min(self.frame_width - self.vertical_width,
+                        x + w + margin - self.vertical_width)
+        
+        # Apply smoothing using weighted moving average
+        self.position_history.append(crop_x)
+        weights = np.exp(np.linspace(-1, 0, len(self.position_history)))
+        weights /= weights.sum()
+        smoothed_position = int(np.average(self.position_history, weights=weights))
+        
+        # Additional boundary check
+        smoothed_position = max(0, min(self.frame_width - self.vertical_width, smoothed_position))
+        
+        self.last_valid_position = smoothed_position
+        return smoothed_position
+
+def detect_faces_and_speakers(input_video_path, output_video_path, frame_interval=2, buffer_time=1.0):
+    """
+    Enhanced face detection with better tracking and speaker detection.
+    Works with pre-trimmed video clip, accounting for buffer time.
+    """
+    global Frames, face_detector_mp
+    Frames = []
+    
+    print("\n=== Starting Face Detection Pipeline ===")
+    print(f"Processing trimmed clip: {input_video_path}")
+    print(f"Frame interval: {frame_interval} (processing every {frame_interval}th frame)")
+    print(f"Buffer time: {buffer_time}s at start and end")
+    
+    if face_detector_mp is None:
+        print("Initializing MediaPipe face detector with high confidence threshold...")
+        face_detector_mp = mp_face_detection.FaceDetection(
+            model_selection=1,  # Use full-range model
+            min_detection_confidence=0.85
         )
 
-        # Run the ffmpeg command
-        ffmpeg_command.run(capture_stdout=True, capture_stderr=True)
+    print("\nAnalyzing video properties...")
+    cap = cv2.VideoCapture(input_video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    vertical_width = int(frame_height * 9 / 16)
+    
+    # Calculate frame ranges accounting for buffer
+    buffer_frames = int(buffer_time * fps)
+    start_frame = buffer_frames
+    end_frame = total_frames - buffer_frames
+    
+    print(f"\nVideo properties:")
+    print(f"- Total frames: {total_frames}")
+    print(f"- Frames to process: {end_frame - start_frame}")
+    print(f"- Buffer frames: {buffer_frames} at start and end")
+    print(f"- FPS: {fps}")
+    print(f"- Resolution: {frame_width}x{frame_height}")
+    print(f"- Target crop width: {vertical_width}")
+    
+    # Extract audio for voice activity detection from trimmed clip
+    print("\nExtracting audio for voice activity detection...")
+    # Create temp_files directory if it doesn't exist
+    temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_video_path)), 'temp_files')
+    os.makedirs(temp_files_dir, exist_ok=True)
+    
+    # Create unique name for temp audio file
+    timestamp = int(time.time())
+    temp_audio_path = os.path.join(temp_files_dir, f"temp_audio_{timestamp}.wav")
+    extractAudio(input_video_path, temp_audio_path)
 
-        print(f"Cropped video saved to: {output_file}")
+    print("\nAnalyzing audio for speech detection...")
+    audio = AudioSegment.from_wav(temp_audio_path)
+    samples = np.array(audio.get_array_of_samples())
+    
+    chunk_duration_ms = 30
+    chunk_size = int(audio.frame_rate * chunk_duration_ms / 1000)
+    voice_activities = []
+    
+    # Only process audio for non-buffer region
+    start_sample = int(buffer_time * audio.frame_rate)
+    end_sample = len(samples) - int(buffer_time * audio.frame_rate)
+    samples = samples[start_sample:end_sample]
+    
+    total_chunks = len(samples) // chunk_size
+    print(f"Processing {total_chunks} audio chunks (excluding buffer regions)...")
+    
+    for i in range(0, len(samples), chunk_size):
+        chunk = samples[i:i + chunk_size]
+        if len(chunk) == chunk_size:
+            energy = np.sum(chunk ** 2) / len(chunk)
+            is_speech = energy > np.mean(samples ** 2) * 1.5
+            voice_activities.append(is_speech)
 
-    except ffmpeg.Error as e:
-        print(f"FFMPEG error: {e.stderr.decode('utf-8')}")
+    print("\nStarting face detection analysis...")
+    tracker = FaceTracker(frame_width, frame_height, vertical_width)
+    frame_count = 0
+    face_detected_count = 0
+    last_progress = 0
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    except Exception as e:
-        print(f"An error occurred during cropping: {e}")
+        # Skip detection in buffer regions but still track for smooth transitions
+        is_in_buffer = frame_count < buffer_frames or frame_count >= (total_frames - buffer_frames)
+        
+        # Progress update every 5%
+        progress = ((frame_count - buffer_frames) / (end_frame - start_frame)) * 100
+        if not is_in_buffer and int(progress) > last_progress and progress % 5 == 0:
+            print(f"Processing: {int(progress)}% complete (frame {frame_count - buffer_frames}/{end_frame - start_frame})")
+            print(f"Faces detected so far: {face_detected_count}")
+            last_progress = int(progress)
 
-# ----------------------------------------------------------------------------
-# Helper function to get video dimensions
-# ----------------------------------------------------------------------------
+        # Only check for speech in non-buffer regions
+        voice_activity_index = int((frame_count - buffer_frames) * chunk_duration_ms / (1000 / fps))
+        is_speaking = False
+        if not is_in_buffer and 0 <= voice_activity_index < len(voice_activities):
+            is_speaking = voice_activities[voice_activity_index]
 
+        current_faces = []
+        if frame_count % frame_interval == 0 and not is_in_buffer:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_detector_mp.process(frame_rgb)
 
-def get_video_dimensions(video_path):
-    probe = ffmpeg.probe(video_path)
-    video_stream = next(
-        (s for s in probe['streams'] if s['codec_type'] == 'video'), None)
-    if video_stream:
-        width = int(video_stream['width'])
-        height = int(video_stream['height'])
-        return width, height
-    else:
-        return None, None
+            if results.detections:
+                for detection in results.detections:
+                    if detection.score[0] > 0.85:
+                        bbox = detection.location_data.relative_bounding_box
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+                        
+                        if (w * h) / (frame_width * frame_height) > 0.01:
+                            current_faces.append([x, y, w, h])
+                            face_detected_count += 1
 
-# ----------------------------------------------------------------------------
-# Helper function to calculate the center of a face
-# ----------------------------------------------------------------------------
+        crop_x = tracker.update(current_faces, is_speaking)
+        if not is_in_buffer:
+            Frames.append([int(crop_x), 0, vertical_width, frame_height])
+        frame_count += 1
 
+    cap.release()
+    
+    # Cleanup temp audio file
+    if os.path.exists(temp_audio_path):
+        try:
+            os.remove(temp_audio_path)
+            print(f"Cleaned up temporary audio file: {temp_audio_path}")
+        except Exception as e:
+            print(f"Warning: Could not remove temporary audio file: {e}")
 
-def face_center(face):
-    x, y, w, h = face
-    return x + w // 2, y + h // 2
+    print("\n=== Face Detection Complete ===")
+    print(f"Total frames analyzed: {end_frame - start_frame}")
+    print(f"Total faces detected: {face_detected_count}")
+    if end_frame - start_frame > 0:
+        print(f"Face detection rate: {(face_detected_count/(end_frame - start_frame))*100:.2f}%")
+    return Frames
 
-# ----------------------------------------------------------------------------
-# Helper function to calculate the cropping rectangle
-# ----------------------------------------------------------------------------
+def ensure_valid_crop_window(x_start, x_end, vertical_width, original_width):
+    if x_end > original_width:
+        x_end = original_width
+        x_start = max(0, x_end - vertical_width)
+    if x_start < 0:
+        x_start = 0
+        x_end = min(original_width, vertical_width)
+    return x_start, x_end
 
-
-def calculate_crop_rect(face_x, face_y, frame_width, frame_height, target_aspect_ratio):
-    """Calculate cropping rectangle with bounds checking and dynamic adjustments."""
-    crop_height = frame_height
-    crop_width = int(crop_height * target_aspect_ratio)
-
-    x_offset = face_x - crop_width // 2
-    x_offset = max(0, min(x_offset, frame_width - crop_width))  # Keep within frame bounds
-
-    # Dynamic adjustment: if face is too close to edge, shift crop
-    margin = int(0.1 * crop_width)  # 10% margin
-    if face_x < x_offset + margin:
-        x_offset = max(0, face_x - margin)
-    elif face_x > x_offset + crop_width - margin:
-        x_offset = min(frame_width - crop_width, face_x - crop_width + margin)
-
-    return x_offset, 0, crop_width, crop_height
-
-# ----------------------------------------------------------------------------
-# Helper function to generate a smooth transition between two crop rectangles
-# ----------------------------------------------------------------------------
-
-
-def generate_tween_frames(start_rect, end_rect, num_frames):
-    x1, y1, w1, h1 = start_rect
-    x2, y2, w2, h2 = end_rect
-
-    frames = []
-    for i in range(num_frames):
-        t = i / (num_frames - 1)
-        x = int(x1 + (x2 - x1) * t)
-        y = int(y1 + (y2 - y1) * t)
-        w = int(w1 + (w2 - w1) * t)
-        h = int(h1 + (h2 - h1) * t)
-        frames.append((x, y, w, h))
-    return frames
-
-# ----------------------------------------------------------------------------
-# Helper function to interpolate between two positions
-# ----------------------------------------------------------------------------
-
-
-def interpolate_position(pos1, pos2, t):
-    """Smooth interpolation between two positions using improved ease-in-out."""
-    # Quintic ease-in-out for smoother transitions
-    t = t * t * t * (t * (t * 6 - 15) + 10)
-    return pos1 + (pos2 - pos1) * t
-
-# ----------------------------------------------------------------------------
-# Helper function to interpolate between two positions using cubic easing
-# ----------------------------------------------------------------------------
-
-
-def smooth_interpolate(pos1, pos2, t):
-    """Enhanced smoother interpolation using cubic easing."""
-    # Improved cubic bezier curve with additional smoothing for 0.25s intervals
-    t2 = t * t
-    t3 = t2 * t
-    # Use a more gradual curve for smoother motion over longer intervals
-    t = t3 * (3 - 2 * t)  # Modified hermite interpolation
-    return pos1 * (1 - t) + pos2 * t
-
-# ----------------------------------------------------------------------------
-# Helper function to analyze audio and determine active speaker
-# ----------------------------------------------------------------------------
-
-
-def analyze_audio_for_speaker(audio_path, frame_count, fps):
-    y, sr = librosa.load(audio_path, sr=None)
-    frame_duration = 1 / fps
-    frame_samples = int(frame_duration * sr)
-    energy = np.array([np.sum(np.abs(y[i:i + frame_samples] ** 2)) for i in range(0, len(y), frame_samples)])
-    return energy[:frame_count]
-
-# ----------------------------------------------------------------------------
-# Detect a face in a video and crop the video around the face
-# ----------------------------------------------------------------------------
-
-
-def extract_audio(input_video, output_audio, start_time, duration):
-    """Extract audio in a separate function for better error handling"""
+def detect_face_and_crop(video_path, output_path, start_time, end_time):
+    global face_detector_mp
     try:
-        if not os.path.exists(input_video):
-            print(f"Input video not found: {input_video}")
-            return False
-            
-        # Create output directory if it doesn't exist
-        os.makedirs(os.path.dirname(output_audio), exist_ok=True)
+        print("\n=== Starting Video Processing Pipeline ===")
+        print(f"Processing segment from {start_time}s to {end_time}s")
         
-        # Extract audio with accurate timing and maintain sync
-        command = [
-            'ffmpeg', '-y',
-            '-i', input_video,
-            '-ss', str(start_time),
-            '-t', str(duration),
-            '-vn',
-            '-af', 'asetpts=PTS-STARTPTS',
-            '-ac', '2',
-            '-ar', '44100',
-            '-b:a', '192k',
-            output_audio
-        ]
+        # Clear any existing frames
+        Frames.clear()
         
-        result = subprocess.run(command, capture_output=True, text=True)
+        # Create temporary directory and get temp files path
+        base_dir = os.path.dirname(os.path.dirname(output_path))
+        temp_files_dir = os.path.join(base_dir, 'temp_files')
+        os.makedirs(temp_files_dir, exist_ok=True)
         
-        if result.returncode != 0:
-            print(f"Error in audio extraction: {result.stderr}")
-            return False
-            
-        # Verify the output file exists and has content
-        if not os.path.exists(output_audio) or os.path.getsize(output_audio) == 0:
-            print(f"Audio extraction failed: Output file is missing or empty")
-            return False
-            
+        # Create temporary clip for processing with 1 second buffer
+        buffer_time = 1.0
+        timestamp = int(time.time())
+        temp_clip_path = os.path.join(temp_files_dir, f"temp_clip_for_detection_{timestamp}.mp4")
+        duration = end_time - start_time
+        
+        print(f"Adding {buffer_time}s buffer to start and end for processing")
+        
+        # Create temp clip with buffer
+        success, adjusted_start_time = create_temp_clip(
+            video_path, 
+            temp_clip_path, 
+            start_time,
+            duration,
+            buffer=buffer_time
+        )
+        
+        if not success:
+            raise Exception("Failed to create temporary clip")
+        
+        print("\nBeginning face detection on temporary clip...")
+        # Detect faces and speakers on the temporary clip - include buffer_time info
+        detect_faces_and_speakers(temp_clip_path, output_path, buffer_time=buffer_time)
+        
+        # Open temporary video to get properties
+        cap = cv2.VideoCapture(temp_clip_path)
+        if not cap.isOpened():
+            raise Exception("Could not open temporary video file")
+
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        vertical_width = int(frame_height * 9 / 16)
+
+        if frame_width < vertical_width:
+            raise Exception("Original video too narrow for vertical format")
+
+        # Initialize tracking variables
+        x_start = (frame_width - vertical_width) // 2
+
+        print("\nProcessing final video segment (removing buffer)...")
+        # Process video segment - start at buffer_time to skip the buffer period
+        success = process_video_segment(
+            temp_clip_path,
+            output_path,
+            buffer_time,  # Skip initial buffer
+            duration,     # Only process the original duration without buffers
+            x_start,
+            vertical_width,
+            frame_height,
+            total_clip_duration=duration + (buffer_time * 2)  # Pass total duration info
+        )
+
+        if not success:
+            raise Exception("Video processing failed")
+
+        cap.release()
         return True
-            
+
     except Exception as e:
-        print(f"Error extracting audio: {str(e)}")
+        print(f"Error in detect_face_and_crop: {str(e)}")
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except:
+                pass
         return False
 
+    finally:
+        # Cleanup temporary files
+        cleanup_resources()
+        # Note: We don't delete temp_files directory since it's shared,
+        # just clean up our temporary files
+        temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_path)), 'temp_files')
+        if os.path.exists(temp_files_dir):
+            try:
+                for file in os.listdir(temp_files_dir):
+                    if file.startswith(('temp_clip_for_detection_', 'temp_audio_', 'temp_output_')):
+                        try:
+                            os.remove(os.path.join(temp_files_dir, file))
+                        except:
+                            pass
+            except:
+                pass
+
+def cleanup_resources():
+    global face_detector_mp
+    if face_detector_mp:
+        face_detector_mp = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def get_hardware_encoder():
-    """Determine the best available hardware encoder"""
     try:
-        # Check for NVIDIA GPU
         nvidia_output = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
         if nvidia_output.returncode == 0:
-            # Verify NVENC support
             ffmpeg_output = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
             if 'h264_nvenc' in ffmpeg_output.stdout:
                 return 'h264_nvenc'
     except:
         pass
-    
-    # Fallback to CPU encoding
     return 'libx264'
 
-def ensure_directory_exists(path):
-    """Ensure directory exists and is writable"""
+def process_video_segment(input_path, output_path, start_time, duration, crop_x, output_width, output_height, total_clip_duration=None):
     try:
-        directory = os.path.dirname(path)
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        # Test write permissions with a temporary file
-        test_file = os.path.join(directory, '.write_test')
-        try:
-            with open(test_file, 'w') as f:
-                f.write('test')
-            os.remove(test_file)
-            return True
-        except Exception as e:
-            print(f"Directory is not writable: {directory}")
-            print(f"Error: {str(e)}")
-            return False
-    except Exception as e:
-        print(f"Could not create/verify directory: {directory}")
-        print(f"Error: {str(e)}")
-        return False
+        print("\n=== Starting Video Processing ===")
+        print(f"Input: {input_path}")
+        print(f"Output: {output_path}")
+        if total_clip_duration:
+            print(f"Total clip duration (with buffer): {total_clip_duration}s")
+            print(f"Processing segment: {start_time}s to {start_time + duration}s (removing buffer)")
+        print(f"Final output duration: {duration}s")
+        print(f"Crop window: {output_width}x{output_height} at x={crop_x}")
 
-def process_video_segment(input_path, output_path, start_time, duration, crop_x, output_width, output_height):
-    """Process a video segment with hardware-accelerated encoding when available"""
-    try:
-        print("\nStarting optimized video processing...")
-        
-        # Verify input file exists and is readable
         if not os.path.exists(input_path):
             raise Exception(f"Input file does not exist: {input_path}")
+
+        # Use temp_files directory instead of temp_processing
+        temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_path)), 'temp_files')
+        os.makedirs(temp_files_dir, exist_ok=True)
         
-        # Ensure output directory exists and is writable
-        if not ensure_directory_exists(output_path):
-            raise Exception("Cannot write to output directory")
+        timestamp = int(time.time())
+        temp_output = os.path.join(temp_files_dir, f"temp_output_{timestamp}.mp4")
         
-        # Create a temporary directory for intermediate files
-        temp_dir = os.path.join(os.path.dirname(output_path), 'temp_processing')
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # Use a unique temporary filename
-        temp_output = os.path.join(temp_dir, f"temp_{os.path.basename(output_path)}")
-        
-        # Get the best available encoder
         encoder = get_hardware_encoder()
-        print(f"Using video encoder: {encoder}")
-        
-        try:
-            # Construct FFmpeg command with improved audio handling
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-ss', str(start_time),
-                '-i', input_path,
-                '-t', str(duration),
-                '-filter_complex', f'[0:v]crop={output_width}:{output_height}:{crop_x}:0,scale=1080:1920[v]', # Scale AFTER crop
-                '-map', '[v]',
-                '-map', '0:a',  # Keep original audio stream
-                '-c:v', encoder,
-                '-vsync', '1',  # Maintain AV sync
-                '-async', '1',  # Audio sync method
-            ]
-            
-            # Add encoder-specific parameters
-            if encoder == 'h264_nvenc':
-                ffmpeg_cmd.extend([
-                    '-preset', 'p4',
-                    '-rc', 'vbr',
-                    '-cq', '23',
-                    '-b:v', '5M'
-                ])
-            else:
-                ffmpeg_cmd.extend([
-                    '-preset', 'veryfast',
-                    '-crf', '23'
-                ])
-            
-            # Add audio and common parameters with improved sync
-            ffmpeg_cmd.extend([
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-ac', '2',
-                '-ar', '44100',
-                '-af', 'aresample=async=1000',  # Handle audio sync issues
-                '-movflags', '+faststart',
-                '-max_muxing_queue_size', '9999',
-                temp_output
-            ])
-            
-            print("Starting FFmpeg process...")
-            print(f"Command: {' '.join(ffmpeg_cmd)}")
-            
-            # Run FFmpeg command
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            # Monitor encoding progress with timeout
-            start_process_time = time.time()
-            timeout = 600  # 10 minutes timeout
-            last_progress_time = start_process_time
-            
-            while True:
-                # Check if process has finished
-                return_code = process.poll()
-                if return_code is not None:
-                    if return_code != 0:
-                        stderr_output = ''.join(process.stderr.readlines())
-                        raise Exception(f"FFmpeg process failed with code {return_code}: {stderr_output}")
-                    break
-                
-                # Check for timeout
-                current_time = time.time()
-                if current_time - start_process_time > timeout:
-                    process.kill()
-                    raise Exception("Video processing timed out after 10 minutes")
-                
-                # Read stderr for progress (fixed duplicate code)
-                stderr_line = process.stderr.readline()
-                if stderr_line:
-                    stderr_line = stderr_line.strip()
-                    if 'frame=' in stderr_line:
-                        print(f"\rEncoding: {stderr_line}", end='', flush=True)
-                        last_progress_time = current_time
-                    elif 'fps=' in stderr_line or 'speed=' in stderr_line:
-                        print(f"\rStats: {stderr_line}", end='', flush=True)
-                
-                # Check if process is stuck
-                if current_time - last_progress_time > 60:  # No progress for 1 minute
-                    process.kill()
-                    raise Exception("Video processing appears to be stuck - no progress for 1 minute")
-                
-                time.sleep(0.1)
-            
-            print("\nVerifying output...")
-            # If successful, move temp file to final location
-            if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
-                # Verify the temp output is a valid video
-                try:
-                    probe = ffmpeg.probe(temp_output)
-                    if any(s['codec_type'] == 'video' for s in probe['streams']):
-                        print("Output validation successful")
-                        # Move temp file to final location
-                        if os.path.exists(output_path):
-                            os.remove(output_path)
-                        os.rename(temp_output, output_path)
-                        print("\nVideo processing complete!")
-                        return True
-                    else:
-                        raise Exception("Temporary output file is not a valid video")
-                except ffmpeg.Error as e:
-                    raise Exception(f"Invalid temporary output file: {str(e)}")
-            else:
-                raise Exception("Temporary output file is missing or empty")
-            
-        finally:
-            # Clean up temporary directory
-            try:
-                if os.path.exists(temp_dir):
-                    for file in os.listdir(temp_dir):
-                        try:
-                            os.remove(os.path.join(temp_dir, file))
-                        except Exception as e:
-                            print(f"Warning: Could not remove temp file {file}: {e}")
-                    os.rmdir(temp_dir)
-            except Exception as e:
-                print(f"Warning: Could not clean up temp directory: {e}")
-        
-    except Exception as e:
-        print(f"\nError during video processing: {str(e)}")
-        if isinstance(e, ffmpeg.Error):
-            print(f"FFmpeg error details: {e.stderr.decode('utf-8') if e.stderr else 'No stderr output'}")
-        return False
+        print(f"\nUsing video encoder: {encoder}")
+        print("Starting FFmpeg processing...")
 
-def calculate_face_score(face, audio_energy, frame_idx, frame_width, frame_height, face_history=None):
-    """Calculate face score with more robust audio handling and framing."""
-    x, y, w, h = face
-    face_size = w * h
-    face_center_x = x + w / 2
-    face_center_y = y + h / 2
-    
-    # Size score (0-1) - prefer larger faces but with diminishing returns
-    size_ratio = face_size / (frame_width * frame_height)
-    size_score = min(1.0, size_ratio * 3)  # Boost small-medium faces
-    
-    # Improved Framing score: More robust handling of partial faces
-    border_margin = 0.05 * frame_width  # Reduced margin
-    fully_visible = (x > border_margin and
-                     x + w < frame_width - border_margin and
-                     y > 0 and
-                     y + h < frame_height)
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(start_time),  # Start after buffer
+            '-i', input_path,
+            '-t', str(duration),     # Only take original duration
+            '-filter_complex', f'[0:v]crop={output_width}:{output_height}:{crop_x}:0,scale=1080:1920[v]',
+            '-map', '[v]',
+            '-map', '0:a',
+            '-c:v', encoder
+        ]
 
-    partially_visible_top = (y < 0 and y + h > 0)
-    partially_visible_bottom = (y + h > frame_height and y < frame_height)
-    partially_visible_left = (x < 0 and x + w > 0)
-    partially_visible_right = (x + w > frame_width and x < frame_width)
-
-    framing_score = 1.0 if fully_visible else 0.7 if (partially_visible_top or partially_visible_bottom or partially_visible_left or partially_visible_right) else 0.3
-
-    # Audio Activity Score:  Handle cases where audio data is missing.
-    audio_score = 0.5  # Default if no audio data
-    if audio_energy is not None and len(audio_energy) > 0:
-        audio_window = 5
-        start_idx = max(0, frame_idx - audio_window)
-        end_idx = min(len(audio_energy), frame_idx + audio_window + 1)
-        if start_idx < end_idx:
-            recent_energy = audio_energy[start_idx:end_idx]
-            audio_score = min(1.0, np.mean(recent_energy) / (np.max(recent_energy) + 1e-9))  # Avoid division by zero
-    else:
-        print("Warning: No audio energy data available. Using default audio score.")
-
-    # Consistency score (0-1) - reward faces that maintain position
-    consistency_score = 0.5
-    if face_history and len(face_history) > 0:
-        prev_centers = [(f[0] + f[2]/2, f[1] + f[3]/2) for f in face_history[-5:]]
-        if prev_centers:
-            distances = [np.sqrt((cx - face_center_x)**2 + (cy - face_center_y)**2) 
-                        for cx, cy in prev_centers]
-            avg_movement = np.mean(distances) if distances else frame_width
-            consistency_score = 1.0 - min(1.0, avg_movement / (frame_width * 0.5))
-
-    # Corrected and Improved Center Weighting (0-1) - Prefer faces closer to center
-    center_dist_x = abs(face_center_x - frame_width / 2) / (frame_width / 2)  # Normalized to 0-1
-    center_dist_y = abs(face_center_y - frame_height / 2) / (frame_height / 2) # Normalized to 0-1
-    center_score = max(0, 1 - (center_dist_x * 0.6 + center_dist_y * 0.4)) # Weighted and capped at 1
-
-    # Weighted combination with emphasis on framing and audio activity
-    weights = {
-        'size': 0.15,
-        'framing': 0.25,
-        'center': 0.15,
-        'audio': 0.30,
-        'consistency': 0.15
-    }
-    
-    final_score = (
-        weights['size'] * size_score +
-        weights['framing'] * framing_score +
-        weights['center'] * center_score +
-        weights['audio'] * audio_score +
-        weights['consistency'] * consistency_score
-    )
-    
-    return final_score
-
-def detect_scene_change(prev_frame, curr_frame, threshold=30.0):
-    """Detect if there's a scene change between frames using optimized comparison"""
-    if prev_frame is None or curr_frame is None:
-        return False
-    
-    try:
-        # Ensure frames are valid
-        if prev_frame.size == 0 or curr_frame.size == 0:
-            return False
-        
-        # Downscale frames for faster comparison
-        scale_factor = 0.25
-        small_prev = cv2.resize(prev_frame, None, fx=scale_factor, fy=scale_factor)
-        small_curr = cv2.resize(curr_frame, None, fx=scale_factor, fy=scale_factor)
-            
-        # Convert frames to grayscale
-        prev_gray = cv2.cvtColor(small_prev, cv2.COLOR_BGR2GRAY)
-        curr_gray = cv2.cvtColor(small_curr, cv2.COLOR_BGR2GRAY)
-        
-        # Calculate frame difference
-        frame_diff = cv2.absdiff(prev_gray, curr_gray)
-        mean_diff = np.mean(frame_diff)
-        
-        return mean_diff > threshold
-    except Exception as e:
-        print(f"Warning: Scene change detection failed: {str(e)}")
-        return False
-
-def process_frame_batch(frames, frame_indices, audio_energy, frame_width, frame_height, face_history):
-    """Process a batch of frames in parallel with optimized memory usage"""
-    results = []
-    
-    # Process frames in smaller chunks to manage memory better
-    chunk_size = 4
-    for i in range(0, len(frames), chunk_size):
-        chunk_frames = frames[i:i + chunk_size]
-        chunk_indices = frame_indices[i:i + chunk_size]
-        
-        chunk_results = []
-        for frame, frame_idx in zip(chunk_frames, chunk_indices):
-            if frame is None or frame.size == 0:
-                continue
-                
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            detections = face_detector_mp.process(frame_rgb)
-            
-            # Clear memory
-            del frame_rgb
-            
-            current_faces = []
-            if detections.detections:
-                for detection in detections.detections:
-                    bbox = detection.location_data.relative_bounding_box
-                    x = int(bbox.xmin * frame_width)
-                    y = int(bbox.ymin * frame_height)
-                    w = int(bbox.width * frame_width)
-                    h = int(bbox.height * frame_height)
-                    
-                    face = (x, y, w, h)
-                    score = calculate_face_score(
-                        face,
-                        audio_energy,
-                        frame_idx,
-                        frame_width,
-                        frame_height,
-                        face_history
-                    )
-                    current_faces.append((face, score))
-            
-            chunk_results.append((frame_idx, current_faces))
-            
-        results.extend(chunk_results)
-        
-        # Force garbage collection after each chunk
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    
-    return results
-
-def cleanup_resources():
-    """Cleanup MediaPipe and other resources"""
-    global face_detector_mp
-    if face_detector_mp:
-        face_detector_mp.close()
-        face_detector_mp = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-def detect_face_and_crop(video_path, output_path, start_time, end_time):
-    global face_detector_mp
-    # Initialize Mediapipe Face Detection
-    mp_face_detection = mp.solutions.face_detection
-    face_detector_mp = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
-
-    try:
-        # Verify input file exists and is readable
-        if not os.path.exists(video_path):
-            raise Exception(f"Input video file does not exist: {video_path}")
-            
-        # Ensure output directory exists and is writable
-        if not ensure_directory_exists(output_path):
-            raise Exception("Cannot write to output directory")
-        
-        # Validate duration and adjust times
-        probe = ffmpeg.probe(video_path) 
-        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-        total_duration = float(probe['format']['duration'])
-        start_time = max(0, min(float(start_time), total_duration))
-        end_time = max(start_time, min(float(end_time), total_duration))
-        duration = end_time - start_time
-
-        # Calculate dimensions
-        frame_width = int(video_info['width'])
-        frame_height = int(video_info['height'])
-        output_height = frame_height
-        output_width = int(output_height * (9/16))
-
-        # Extract audio for speaker detection with better error handling
-        temp_audio = os.path.join(os.path.dirname(output_path), "temp_audio.wav")
-        audio_energy = []
-        
-        audio_extracted = extract_audio(video_path, temp_audio, start_time, duration)
-        if audio_extracted:
-            try:
-                # Get audio energy profile with error handling
-                y, sr = librosa.load(temp_audio, sr=None)
-                if y is not None and len(y) > 0:
-                    hop_length = int(sr / 30)  # For 30fps video
-                    audio_energy = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-                else:
-                    print("Warning: Audio loaded but empty, continuing without audio analysis")
-            except Exception as e:
-                print(f"Warning: Audio analysis failed: {str(e)}, continuing without audio analysis")
+        if encoder == 'h264_nvenc':
+            ffmpeg_cmd.extend(['-preset', 'p4', '-rc', 'vbr', '-cq', '23', '-b:v', '5M'])
         else:
-            print("Warning: Audio extraction failed, continuing without audio analysis")
+            ffmpeg_cmd.extend(['-preset', 'veryfast', '-crf', '23'])
 
-        # Clean up audio file if it exists
-        if os.path.exists(temp_audio):
-            try:
-                os.remove(temp_audio)
-            except Exception as e:
-                print(f"Warning: Failed to clean up temp audio file: {str(e)}")
+        ffmpeg_cmd.extend([
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-ac', '2',
+            '-ar', '44100',
+            '-movflags', '+faststart',
+            temp_output
+        ])
 
-        # Initialize face tracking with enhanced history
-        face_history = []  # Store full face information
-        position_history = []  # Store crop positions
-        smoothing_window = 15  # Increased window for smoother transitions
+        process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
         
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
-        frame_idx = 0
-        
-        # Track scene changes
-        scene_change_frames = []
-        last_scene_change = 0
-        
-        # Buffer for face scoring
-        face_score_buffer = []
-        score_buffer_size = 5
-        
-        # Initialize frame processing
-        frame_buffer_size = 8  # Process frames in batches of 8
-        frame_buffer = deque(maxlen=frame_buffer_size)
-        frame_idx_buffer = deque(maxlen=frame_buffer_size)
-        
-        # Get total frame count for progress tracking
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        processed_frames = 0
-        last_progress_update = 0
-        process_start_time = time.time()  # Renamed to avoid conflict with start_time parameter
-        
-        print(f"\nStarting frame analysis of {total_frames:,} frames...")
-        print("Progress: [" + "-" * 20 + "]")
-        print("          ", end="", flush=True)
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_batch = {}
-            
-            # Read first frame to initialize
-            ret, frame = cap.read()
-            if not ret or frame is None or frame.size == 0:
-                raise Exception("Could not read valid first frame")
-            
-            prev_frame = frame.copy()
-            processed_frames += 1
-            
-            # Initialize buffers with first frame if it's valid
-            if frame is not None and frame.size > 0:
-                frame_buffer.append(frame.copy())
-                frame_idx_buffer.append(frame_idx)
-                frame_idx += 1
-            
-            # Scene detection optimization
-            scene_check_interval = 5  # Check every 5 frames for scene changes
-            scene_check_counter = 0
-            
-            while cap.get(cv2.CAP_PROP_POS_MSEC) <= end_time * 1000:
-                ret, frame = cap.read()
-                if not ret or frame is None or frame.size == 0:
-                    print("\nReached end of video or invalid frame")
-                    break
-                
-                processed_frames += 1
-                
-                # Update progress bar every 5%
-                progress = (processed_frames / total_frames) * 100
-                if progress - last_progress_update >= 5:
-                    print("█", end="", flush=True)
-                    last_progress_update = progress
-                
-                # Print detailed status every 30 frames
-                if processed_frames % 30 == 0:
-                    elapsed_time = time.time() - process_start_time
-                    frames_per_second = processed_frames / elapsed_time
-                    remaining_frames = total_frames - processed_frames
-                    estimated_remaining = remaining_frames / frames_per_second if frames_per_second > 0 else 0
-                    
-                    print(f"\rFrame: {processed_frames:,}/{total_frames:,} ({progress:,.1f}%) | "
-                          f"ETA: {estimated_remaining:.1f}s | "
-                          f"Speed: {frames_per_second:.1f} fps | "
-                          f"Batches: {len(future_to_batch)}", end="    \r", flush=True)
-                
-                # Buffer frames for batch processing
-                frame_buffer.append(frame.copy())
-                frame_idx_buffer.append(frame_idx)
-                
-                # Only check for scene changes periodically to improve performance
-                if scene_check_counter % scene_check_interval == 0:
-                    is_scene_change = detect_scene_change(prev_frame, frame)
-                    if is_scene_change:
-                        scene_change_frames.append(frame_idx)
-                        face_history = []
-                        position_history = []
-                        face_score_buffer = []
-                        last_scene_change = frame_idx
-                    prev_frame = frame.copy()
-                scene_check_counter += 1
-                
-                # Process batch when buffer is full
-                if len(frame_buffer) == frame_buffer_size:
-                    future = executor.submit(
-                        process_frame_batch,
-                        list(frame_buffer),
-                        list(frame_idx_buffer),
-                        audio_energy,
-                        frame_width,
-                        frame_height,
-                        face_history
-                    )
-                    future_to_batch[future] = list(frame_idx_buffer)
-                    print(f"\rProcessing batch {len(future_to_batch)} | Frame {processed_frames}/{total_frames} ({progress:.1f}%)", end="", flush=True)
-                    frame_buffer.clear()
-                    frame_idx_buffer.clear()
-                
-                # Process completed batches
-                completed_batches = 0
-                for future in list(future_to_batch.keys()):
-                    if future.done():
-                        batch_results = future.result()
-                        completed_batches += 1
-                        for frame_idx, current_faces in batch_results:
-                            if current_faces:
-                                # Sort faces by score
-                                current_faces.sort(key=lambda x: x[1], reverse=True)
-                                best_face = current_faces[0][0]
-                                
-                                face_history.append(best_face)
-                                if len(face_history) > smoothing_window:
-                                    face_history.pop(0)
-                                
-                                # Calculate crop position with scene awareness
-                                face_center_x = best_face[0] + best_face[2] // 2
-                                
-                                if position_history:
-                                    frames_since_scene_change = frame_idx - last_scene_change
-                                    max_movement = (
-                                        frame_width * 0.5 if frames_since_scene_change < 5
-                                        else frame_width * 0.02
-                                    )
-                                    
-                                    prev_x = position_history[-1]
-                                    delta = face_center_x - prev_x
-                                    
-                                    if abs(delta) > max_movement:
-                                        movement_factor = min(1.0, max_movement / abs(delta))
-                                        face_center_x = prev_x + (delta * movement_factor)
-                                
-                                position_history.append(face_center_x)
-                                if len(position_history) > smoothing_window:
-                                    position_history.pop(0)
-                        
-                        del future_to_batch[future]
-                
-                frame_idx += 1
-            
-            print("]")
-            print("\nProcessing remaining frames...")
-            
-            # Process remaining frames in buffer
-            if frame_buffer:
-                batch_results = process_frame_batch(
-                    list(frame_buffer),
-                    list(frame_idx_buffer),
-                    audio_energy,
-                    frame_width,
-                    frame_height,
-                    face_history
-                )
-                # Process final batch results similarly to above
-            
-            print("\nFrame analysis complete!")
-            print("Finalizing video processing...")
-            
-            cap.release()
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg process failed: {process.stderr}")
 
-        # Clean up temporary audio file
-        if os.path.exists(temp_audio):
-            os.remove(temp_audio)
-
-        # Calculate final crop position with improved horizontal sliding
-        if position_history: 
-            # Use exponential moving average for final positions
-            alpha = 0.3  # Smoothing factor for horizontal movement
-            smoothed_positions = []
-            current_smooth = position_history[0]
-            for pos in position_history:
-                current_smooth = alpha * pos + (1 - alpha) * current_smooth
-                smoothed_positions.append(current_smooth)
-            avg_face_center_x = int(smoothed_positions[-1])
-            
-            # Compute horizontal offset from frame center
-            frame_center_x = frame_width // 2
-            horizontal_offset = avg_face_center_x - frame_center_x
-            
-            # Apply a fraction of the offset to ensure the face stays near the center
-            adjustment = int(horizontal_offset * 0.3)
-            crop_x = max(0, min(avg_face_center_x - output_width // 2 + adjustment, frame_width - output_width))
-        else:
-            crop_x = (frame_width - output_width) // 2
-
-        print("\nStarting optimized video encoding...")
-        # Process video with better error handling
-        success = process_video_segment(
-            video_path,
-            output_path,
-            start_time,
-            duration,
-            crop_x,
-            output_width,
-            output_height
-        )
-        
-        if not success:
-            raise Exception("Video processing failed - check previous error messages")
-            
-        # Final validation of output
-        if not os.path.exists(output_path):
-            raise Exception("Output file was not created during processing")
-            
-        if os.path.getsize(output_path) == 0:
-            raise Exception("Output file is empty after processing")
-            
-        try:
-            # Verify the output is a valid video file
-            probe = ffmpeg.probe(output_path)
-            if not any(s['codec_type'] == 'video' for s in probe['streams']):
-                raise Exception("Output file does not contain a valid video stream")
-        except ffmpeg.Error as e:
-            raise Exception(f"Invalid output video file: {str(e)}")
-        
-        print(f"\nSuccessfully created video at: {output_path}")
-        return True
-
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        # Clean up any partial output
-        if os.path.exists(output_path):
-            try:
+        if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+            if os.path.exists(output_path):
                 os.remove(output_path)
-                print("Cleaned up partial output file")
-            except Exception as cleanup_error:
-                print(f"Warning: Could not clean up partial output: {cleanup_error}")
-        raise
-    finally:
-        cleanup_resources()
+            os.rename(temp_output, output_path)
+            print(f"\nVideo processing complete: {output_path}")
+            return True
+        else:
+            raise Exception("Output file is missing or empty")
 
-# Cleanup on module exit
+    except Exception as e:
+        print(f"Error during video processing: {str(e)}")
+        # Clean up temp file if it exists
+        if os.path.exists(temp_output):
+            try:
+                os.remove(temp_output)
+            except:
+                pass
+        return False
+
+    finally:
+        # Only clean up our specific temp files
+        temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_path)), 'temp_files')
+        if os.path.exists(temp_files_dir):
+            try:
+                for file in os.listdir(temp_files_dir):
+                    if file.startswith('temp_output_'):
+                        try:
+                            os.remove(os.path.join(temp_files_dir, file))
+                        except:
+                            pass
+            except:
+                pass
+
+def create_temp_clip(video_path, temp_path, start_time, duration, buffer=1.0):
+    """Creates a temporary clip from the video with buffer time on both ends"""
+    try:
+        print("\n=== Creating Initial Temp Clip ===")
+        start_with_buffer = max(0, start_time - buffer)
+        duration_with_buffer = duration + (buffer * 2)
+        
+        print(f"Original segment: {start_time}s to {start_time + duration}s")
+        print(f"With buffer: {start_with_buffer}s to {start_with_buffer + duration_with_buffer}s")
+        print(f"Buffer size: {buffer}s on each end")
+        
+        encoder = get_hardware_encoder()
+        print(f"Using encoder: {encoder}")
+        print("Starting clip extraction...")
+        
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(start_with_buffer),
+            '-i', video_path,
+            '-t', str(duration_with_buffer),
+            '-c:v', encoder,
+            '-c:a', 'aac',
+            temp_path
+        ]
+        
+        process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg process failed: {process.stderr}")
+        
+        print(f"Temp clip created successfully: {temp_path}")
+        print(f"Clip duration: {duration_with_buffer}s")
+        
+        return True, start_with_buffer
+    except Exception as e:
+        print(f"Error creating temp clip: {str(e)}")
+        return False, 0
+
+# Register cleanup on module exit
 import atexit
 atexit.register(cleanup_resources)
