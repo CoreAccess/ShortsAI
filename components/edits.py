@@ -5,7 +5,7 @@ import torch
 import subprocess
 import threading
 import queue
-import concurrent.futures
+import concurrent.futures 
 import time
 import psutil
 from collections import deque
@@ -19,10 +19,6 @@ use_cuda = torch.cuda.is_available()
 device = torch.device('cuda:0' if use_cuda else 'cpu')
 
 # Removed: dlib landmark_predictor initialization since it isn't used
-
-# Initialize Mediapipe Face Detection
-mp_face_detection = mp.solutions.face_detection
-face_detector_mp = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
 
 def prepare_frame(frame):
     """Convert frame to RGB for PyTorch processing"""
@@ -132,11 +128,19 @@ def face_center(face):
 
 
 def calculate_crop_rect(face_x, face_y, frame_width, frame_height, target_aspect_ratio):
+    """Calculate cropping rectangle with bounds checking and dynamic adjustments."""
     crop_height = frame_height
     crop_width = int(crop_height * target_aspect_ratio)
 
     x_offset = face_x - crop_width // 2
-    x_offset = max(0, min(x_offset, frame_width - crop_width))
+    x_offset = max(0, min(x_offset, frame_width - crop_width))  # Keep within frame bounds
+
+    # Dynamic adjustment: if face is too close to edge, shift crop
+    margin = int(0.1 * crop_width)  # 10% margin
+    if face_x < x_offset + margin:
+        x_offset = max(0, face_x - margin)
+    elif face_x > x_offset + crop_width - margin:
+        x_offset = min(frame_width - crop_width, face_x - crop_width + margin)
 
     return x_offset, 0, crop_width, crop_height
 
@@ -311,9 +315,9 @@ def process_video_segment(input_path, output_path, start_time, duration, crop_x,
                 '-ss', str(start_time),
                 '-i', input_path,
                 '-t', str(duration),
-                '-filter_complex', f'[0:v]crop={output_width}:{output_height}:{crop_x}:0,scale=1080:1920[v]',
+                '-filter_complex', f'[0:v]crop={output_width}:{output_height}:{crop_x}:0,scale=1080:1920[v]', # Scale AFTER crop
                 '-map', '[v]',
-                '-map', '0:a',
+                '-map', '0:a',  # Keep original audio stream
                 '-c:v', encoder,
                 '-vsync', '1',  # Maintain AV sync
                 '-async', '1',  # Audio sync method
@@ -434,38 +438,41 @@ def process_video_segment(input_path, output_path, start_time, duration, crop_x,
         return False
 
 def calculate_face_score(face, audio_energy, frame_idx, frame_width, frame_height, face_history=None):
-    """Calculate a score for each detected face with improved weighting for active speakers"""
+    """Calculate face score with more robust audio handling and framing."""
     x, y, w, h = face
     face_size = w * h
-    face_center_x = x + w/2
-    face_center_y = y + h/2
+    face_center_x = x + w / 2
+    face_center_y = y + h / 2
     
     # Size score (0-1) - prefer larger faces but with diminishing returns
     size_ratio = face_size / (frame_width * frame_height)
     size_score = min(1.0, size_ratio * 3)  # Boost small-medium faces
     
-    # Framing score (0-1) - penalize partial faces and shoulders
-    border_margin = 0.1 * frame_width
-    fully_visible = (x > border_margin and 
-                    x + w < frame_width - border_margin and 
-                    y > 0 and 
-                    y + h < frame_height)
-    framing_score = 1.0 if fully_visible else 0.3 
-    
-    # Center weighting (0-1) - prefer faces closer to vertical center
-    center_dist_x = abs(face_center_x - frame_width/2) / frame_width
-    center_dist_y = abs(face_center_y - frame_height/2) / frame_height
-    center_score = 1 - (center_dist_x * 0.7 + center_dist_y * 0.3)
-    
-    # Audio activity score (0-1) with temporal smoothing
-    audio_window = 5  # Look at surrounding frames
-    start_idx = max(0, frame_idx - audio_window)
-    end_idx = min(len(audio_energy), frame_idx + audio_window + 1)
-    if start_idx < end_idx and len(audio_energy) > 0:
-        recent_energy = audio_energy[start_idx:end_idx]
-        audio_score = min(1.0, np.mean(recent_energy) / np.max(audio_energy))
+    # Improved Framing score: More robust handling of partial faces
+    border_margin = 0.05 * frame_width  # Reduced margin
+    fully_visible = (x > border_margin and
+                     x + w < frame_width - border_margin and
+                     y > 0 and
+                     y + h < frame_height)
+
+    partially_visible_top = (y < 0 and y + h > 0)
+    partially_visible_bottom = (y + h > frame_height and y < frame_height)
+    partially_visible_left = (x < 0 and x + w > 0)
+    partially_visible_right = (x + w > frame_width and x < frame_width)
+
+    framing_score = 1.0 if fully_visible else 0.7 if (partially_visible_top or partially_visible_bottom or partially_visible_left or partially_visible_right) else 0.3
+
+    # Audio Activity Score:  Handle cases where audio data is missing.
+    audio_score = 0.5  # Default if no audio data
+    if audio_energy is not None and len(audio_energy) > 0:
+        audio_window = 5
+        start_idx = max(0, frame_idx - audio_window)
+        end_idx = min(len(audio_energy), frame_idx + audio_window + 1)
+        if start_idx < end_idx:
+            recent_energy = audio_energy[start_idx:end_idx]
+            audio_score = min(1.0, np.mean(recent_energy) / (np.max(recent_energy) + 1e-9))  # Avoid division by zero
     else:
-        audio_score = 0.5
+        print("Warning: No audio energy data available. Using default audio score.")
 
     # Consistency score (0-1) - reward faces that maintain position
     consistency_score = 0.5
@@ -476,6 +483,11 @@ def calculate_face_score(face, audio_energy, frame_idx, frame_width, frame_heigh
                         for cx, cy in prev_centers]
             avg_movement = np.mean(distances) if distances else frame_width
             consistency_score = 1.0 - min(1.0, avg_movement / (frame_width * 0.5))
+
+    # Corrected and Improved Center Weighting (0-1) - Prefer faces closer to center
+    center_dist_x = abs(face_center_x - frame_width / 2) / (frame_width / 2)  # Normalized to 0-1
+    center_dist_y = abs(face_center_y - frame_height / 2) / (frame_height / 2) # Normalized to 0-1
+    center_score = max(0, 1 - (center_dist_x * 0.6 + center_dist_y * 0.4)) # Weighted and capped at 1
 
     # Weighted combination with emphasis on framing and audio activity
     weights = {
@@ -585,6 +597,11 @@ def cleanup_resources():
         torch.cuda.empty_cache()
 
 def detect_face_and_crop(video_path, output_path, start_time, end_time):
+    global face_detector_mp
+    # Initialize Mediapipe Face Detection
+    mp_face_detection = mp.solutions.face_detection
+    face_detector_mp = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+
     try:
         # Verify input file exists and is readable
         if not os.path.exists(video_path):
@@ -810,19 +827,24 @@ def detect_face_and_crop(video_path, output_path, start_time, end_time):
         if os.path.exists(temp_audio):
             os.remove(temp_audio)
 
-        # Calculate final crop position with improved smoothing
-        if position_history:
+        # Calculate final crop position with improved horizontal sliding
+        if position_history: 
             # Use exponential moving average for final positions
-            alpha = 0.3  # Smoothing factor
+            alpha = 0.3  # Smoothing factor for horizontal movement
             smoothed_positions = []
             current_smooth = position_history[0]
-            
             for pos in position_history:
                 current_smooth = alpha * pos + (1 - alpha) * current_smooth
                 smoothed_positions.append(current_smooth)
+            avg_face_center_x = int(smoothed_positions[-1])
             
-            center_x = int(smoothed_positions[-1])
-            crop_x = max(0, min(center_x - output_width // 2, frame_width - output_width))
+            # Compute horizontal offset from frame center
+            frame_center_x = frame_width // 2
+            horizontal_offset = avg_face_center_x - frame_center_x
+            
+            # Apply a fraction of the offset to ensure the face stays near the center
+            adjustment = int(horizontal_offset * 0.3)
+            crop_x = max(0, min(avg_face_center_x - output_width // 2 + adjustment, frame_width - output_width))
         else:
             crop_x = (frame_width - output_width) // 2
 
