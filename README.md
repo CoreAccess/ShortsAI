@@ -19,6 +19,9 @@ Additionally the goal is to have everything run locally (no need to pay for Open
 -   **Face Tracking & Cropping**: Still needs work to track faces and crop correctly
 -   **One Last Note**: Still in active development and each day changes a TON, keep this in mind please
 
+## Future Thoughts
+-   **Better Clip Selection**: I might create a system that does facial and speaker detection on the entire video from start to finish, then do crop analysis to determine sections of the video where faces can be stable inside the final crop, from there I can determine the approx start and end times of clips, then analyse the transcripts and perform sentiment analysis and conversation detection, adjust for start and ends of conversations and build clips around that.
+
 ## Installation
 
 ### Prerequisites

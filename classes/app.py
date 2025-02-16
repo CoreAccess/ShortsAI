@@ -58,20 +58,17 @@ class AppClass:
                             filepath = os.path.abspath(file_path)
                             self.processing_progress[filename] = {"progress": 0, "error": False}
 
-                            def process_video_with_monitoring(*args):
+                            def process_video_with_monitoring():
                                 try:
-                                    process_video(*args) 
+                                    process_video(filepath, self.processing_progress, 
+                                                self.app.config['TEMP_FOLDER'],
+                                                self.app.config['FINISHED_FOLDER'])
                                 except Exception as e:
                                     print(f"Unhandled exception in processing thread: {str(e)}")
                                 finally:
                                     process_next_video()  # Process the next video after the current one finishes
                             
-                            thread = threading.Thread(target=process_video_with_monitoring, args=(
-                                filepath, 
-                                self.processing_progress,
-                                self.app.config['TEMP_FOLDER'],
-                                self.app.config['FINISHED_FOLDER']
-                            ))
+                            thread = threading.Thread(target=process_video_with_monitoring)
                             thread.daemon = True
                             thread.start()
                             

@@ -174,27 +174,41 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
                         last_end_time = word_end
 
             ass_file = os.path.join(temp_dir, f"{file_hash}_subtitles_{start_time:.2f}_{end_time:.2f}.ass")
-            print("Starting Subtitle Generation...")
-            write_ass(subtitles, ass_file, cropped_file)
 
-            if not os.path.exists(subtitled_file):
-                # Check if the cropped file exists before burning subtitles
-                if os.path.exists(cropped_file):
+            # Only proceed with subtitle burning if we have a cropped file
+            if os.path.exists(cropped_file):
+                print("Starting Subtitle Generation...")
+                write_ass(subtitles, ass_file, cropped_file)
+
+                if not os.path.exists(subtitled_file):
                     burn_subtitles(cropped_file, ass_file, subtitled_file)
                     print(f"Generated Clip With Subtitles At: {subtitled_file}")
                 else:
-                    print(f"Cropped file does not exist before burning subtitles: {cropped_file}")
+                    print(f"Existing Clip Already Exists Using: {subtitled_file}")
+
+                # Only try to copy if the subtitled file was created successfully
+                if os.path.exists(subtitled_file):
+                    print(f"Final Clip Ready For Viewing At: {subtitled_file}")
+                    progress_dict[filename] = {"progress": 95, "error": False}
+
+                    # Move the final video to finished_videos folder
+                    final_video_name = f"{os.path.splitext(filename)[0]}_short_{start_time:.2f}_{end_time:.2f}.mp4"
+                    final_video_path = os.path.join(finished_dir, final_video_name)
+                    try:
+                        shutil.copy2(subtitled_file, final_video_path)
+                        print(f"Moved final video to: {final_video_path}")
+                    except Exception as e:
+                        print(f"Error copying final video: {str(e)}")
+                        progress_dict[filename] = {"progress": 0, "error": True}
+                        continue
+                else:
+                    print("Subtitled file was not created successfully")
+                    progress_dict[filename] = {"progress": 0, "error": True}
+                    continue
             else:
-                print(f"Existing Clip Already Exists Using: {subtitled_file}")
-
-            print(f"Final Clip Ready For Viewing At: {subtitled_file}")
-            progress_dict[filename] = {"progress": 95, "error": False}
-
-            # Move the final video to finished_videos folder
-            final_video_name = f"{os.path.splitext(filename)[0]}_short_{start_time:.2f}_{end_time:.2f}.mp4"
-            final_video_path = os.path.join(finished_dir, final_video_name)
-            shutil.copy2(subtitled_file, final_video_path)
-            print(f"Moved final video to: {final_video_path}")
+                print(f"Skipping subtitle generation - cropped file does not exist: {cropped_file}")
+                progress_dict[filename] = {"progress": 0, "error": True}
+                continue
 
         # Delete the original video from uploads
         if os.path.exists(video_path):
@@ -210,12 +224,16 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         import traceback
         traceback.print_exc()
     finally:
-        # Loop through and delete all files in the temp_files folder
-        for file in os.listdir(temp_dir):
-            file_path = os.path.join(temp_dir, file)
-            try:
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
-            except Exception as e:
-                print(f"Error deleting file: {file_path}")
-                print(e)
+        # Only clean up temp files after all segments are processed
+        if progress_dict[filename]["progress"] == 100:
+            print("Processing complete, cleaning up temporary files...")
+            # Loop through and delete all files in the temp_files folder
+            for file in os.listdir(temp_dir):
+                file_path = os.path.join(temp_dir, file)
+                try:
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+                        print(f"Deleted temporary file: {file_path}")
+                except Exception as e:
+                    print(f"Error deleting file: {file_path}")
+                    print(e)
