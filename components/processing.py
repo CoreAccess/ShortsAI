@@ -53,7 +53,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         transcription = transcribe_audio(audio_path, transcript_path)
 
         progress_dict[filename] = {"progress": 40, "error": False}
-
+        
         print("Starting Conversation Detection Process...")
         conversations = conversation_detection(transcription)
 
@@ -105,7 +105,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         print(f"Updated transcript with {len(interesting_segments)} potential conversation segments")
 
         # Clamp this to 2 for now, remove it later on
-        interesting_segments = interesting_segments[:1] 
+        #interesting_segments = interesting_segments[:1] 
 
         # Process each interesting segment
         for idx, segment in enumerate(interesting_segments, 1):
@@ -210,7 +210,6 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         import traceback
         traceback.print_exc()
     finally:
-        '''
         # Loop through and delete all files in the temp_files folder
         for file in os.listdir(temp_dir):
             file_path = os.path.join(temp_dir, file)
@@ -220,4 +219,3 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
             except Exception as e:
                 print(f"Error deleting file: {file_path}")
                 print(e)
-        '''
