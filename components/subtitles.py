@@ -2,6 +2,7 @@ import os
 import ffmpeg
 import pysubs2
 from components.helpers import normalize_path, get_video_duration
+import cv2
 
 # Dynamically determine the path to the subscribe image
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -134,6 +135,31 @@ def burn_subtitles(video_path, ass_path, output_path):
     subscribe_img_path_fixed = normalize_path(subscribe_img_path)
     
     try:
+        # Verify video dimensions are valid for x264
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(3))  # cv2.CAP_PROP_WIDTH is 3
+        height = int(cap.get(4))  # cv2.CAP_PROP_HEIGHT is 4
+        cap.release()
+
+        # If width is odd, we need to crop one pixel off
+        if width % 2 != 0:
+            print(f"Adjusting video width from {width} to {width-1} to ensure even dimensions")
+            # Create a temporary file for the resized video
+            temp_output = output_path.replace('.mp4', '_temp.mp4')
+            
+            # Use ffmpeg to crop one pixel if needed
+            stream = (
+                ffmpeg
+                .input(video_path)
+                .filter('crop', width - (width % 2), height)
+                .output(temp_output, acodec='copy')
+                .overwrite_output()
+            )
+            stream.run(capture_stdout=True, capture_stderr=True)
+            
+            # Use the adjusted video for further processing
+            video_path = temp_output
+
         # Get video duration for overlay timing
         video_duration = get_video_duration(video_path)
         overlay_start = video_duration - 15.0
@@ -155,20 +181,43 @@ def burn_subtitles(video_path, ass_path, output_path):
 
         print("Starting FFmpeg process...")
         
-        # Check if the input video has an audio stream
+        # More robust audio stream detection and handling
         probe = ffmpeg.probe(video_path)
-        has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
-
-        # Create the output with both video and audio if audio stream exists
-        if has_audio:
-            stream = ffmpeg.output(final_video, video.audio, output_path, acodec='copy', vcodec='libx264', preset='fast', crf=23, movflags='+faststart', threads=4)
+        audio_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
+        
+        if audio_streams:
+            print(f"Found {len(audio_streams)} audio stream(s)")
+            # Try to preserve original audio codec if possible
+            audio_codec = audio_streams[0].get('codec_name', 'aac')
+            stream = ffmpeg.output(
+                final_video, 
+                video.audio, 
+                output_path,
+                acodec=audio_codec if audio_codec != 'pcm_s16le' else 'aac',  # Use AAC if source is PCM
+                vcodec='libx264',
+                preset='fast',
+                crf=23,
+                movflags='+faststart',
+                threads=4
+            )
         else:
-            stream = ffmpeg.output(final_video, output_path, vcodec='libx264', preset='fast', crf=23, movflags='+faststart', threads=4)
+            print("No audio streams found in input, creating video without audio")
+            stream = ffmpeg.output(
+                final_video,
+                output_path,
+                vcodec='libx264',
+                preset='fast',
+                crf=23,
+                movflags='+faststart',
+                threads=4
+            )
 
-        # Run the ffmpeg command
-        #print(f"FFmpeg command: {stream.compile()}")  # Debug: print the FFmpeg command
         stream.overwrite_output().run(capture_stdout=True, capture_stderr=True)
-        print(f"FFmpeg process completed.")  # Debug: print when FFmpeg process is completed
+        print(f"FFmpeg process completed.")
+        
+        # Clean up temporary file if it was created
+        if width % 2 != 0 and os.path.exists(temp_output):
+            os.remove(temp_output)
         
         print(f"Subtitles burned successfully, output saved to: {output_path}")
  

@@ -1,908 +1,1050 @@
 import cv2
-import ffmpeg
-import os
-import torch
-import subprocess
-import threading
-import queue
-import concurrent.futures 
-import time 
-import psutil
-from collections import deque
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
-import mediapipe as mp
 import numpy as np
+import torch
 import librosa
-import wave
-import contextlib
-from pydub import AudioSegment
+import os
+from moviepy.editor import VideoFileClip, AudioFileClip, VideoClip, clips_array, vfx
+import subprocess
+from typing import Tuple, List, Dict, Optional
+import mediapipe as mp
+from collections import deque
+from contextlib import contextmanager
+import tempfile
 
-# Check if CUDA is available
-use_cuda = torch.cuda.is_available()
-device = torch.device('cuda:0' if use_cuda else 'cpu')
-
-# Initialize MediaPipe face detection
-mp_face_detection = mp.solutions.face_detection
-face_detector_mp = None
-
-# Global frames storage for face tracking
-global Frames
-Frames = []
-
-def prepare_frame(frame):
-    """Convert frame to RGB for PyTorch processing"""
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    if use_cuda:
-        # Clear CUDA cache periodically
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    return frame_rgb 
-
-# ----------------------------------------------------------------------------
-# Extract audio from a video file
-# ----------------------------------------------------------------------------
-
-
-def extractAudio(video_path, audio_path):
-    try:
-        temp_files_dir = os.path.dirname(audio_path)
-        print(f"Extracting audio to temp_files directory: {temp_files_dir}")
-        
-        # Ensure the temp directory exists
-        os.makedirs(temp_files_dir, exist_ok=True)
-        
-        audio = AudioSegment.from_file(video_path)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        audio.export(audio_path, format="wav")
-        print(f"Audio extracted successfully to: {audio_path}")
-        
-        # Register the audio file for cleanup later
-        register_temp_file(audio_path)
-        
-        return audio_path
-    except Exception as e:
-        print(f"An Error Occurred While Extracting Audio: {e}")
-        return None
-
-def process_audio_frame(audio_data, sample_rate=16000, frame_duration_ms=30):
-    n = int(sample_rate * frame_duration_ms / 1000) * 2
-    offset = 0
-    while offset + n <= len(audio_data):
-        frame = audio_data[offset:offset + n]
-        offset += n
-        yield frame
-
-def create_temp_clip(video_path, temp_path, start_time, duration, buffer=1.0):
-    """Creates a temporary clip from the video with buffer time on both ends"""
-    try:
-        print("\n=== Creating Initial Temp Clip ===")
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Input video not found: {video_path}")
-            
-        start_with_buffer = max(0, start_time - buffer)
-        duration_with_buffer = duration + (buffer * 2)
-        
-        print(f"Original segment: {start_time}s to {start_time + duration}s")
-        print(f"With buffer: {start_with_buffer}s to {start_with_buffer + duration_with_buffer}s")
-        print(f"Buffer size: {buffer}s on each end")
-        
-        encoder = get_hardware_encoder()
-        print(f"Using encoder: {encoder}")
-        print("Starting clip extraction...")
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-        
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-ss', str(start_with_buffer),
-            '-i', video_path,
-            '-t', str(duration_with_buffer),
-            '-c:v', encoder,
-            '-c:a', 'aac',
-            temp_path
-        ]
-        
-        process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        if process.returncode != 0:
-            print("FFmpeg stderr output:")
-            print(process.stderr)
-            raise Exception(f"FFmpeg process failed")
-        
-        if not os.path.exists(temp_path):
-            raise FileNotFoundError(f"FFmpeg did not create the temporary clip at: {temp_path}")
-            
-        if os.path.getsize(temp_path) == 0:
-            raise Exception(f"FFmpeg created an empty temporary clip")
-        
-        print(f"Temp clip created successfully: {temp_path}")
-        print(f"Clip duration: {duration_with_buffer}s")
-        print(f"File size: {os.path.getsize(temp_path) / (1024*1024):.2f} MB")
-        
-        return True, start_with_buffer
-        
-    except Exception as e:
-        print(f"\nError creating temp clip: {str(e)}")
-        return False, 0
-
-class FaceTracker:
-    def __init__(self, frame_width, frame_height, vertical_width):
-        self.frame_width = frame_width
-        self.frame_height = frame_height
-        self.vertical_width = vertical_width
-        self.history_size = 15  # 0.5 seconds at 30fps
-        self.position_history = deque(maxlen=self.history_size)
-        self.face_history = deque(maxlen=self.history_size)
-        self.no_face_counter = 0
-        self.max_no_face_frames = 30  # 1 second at 30fps
-        self.last_valid_position = None
-        self.center_position = (frame_width - vertical_width) // 2
-        self.confidence_threshold = 0.85
-        self.movement_smoothing = 0.4
-        self.speaker_bonus = 1.5
-        self.min_movement_threshold = 10
-        self.max_movement_per_frame = vertical_width * 0.3
-
-    def update(self, faces, is_speaking=False):
-        if not faces:
-            self.no_face_counter += 1
-            if self.no_face_counter >= self.max_no_face_frames:
-                # Transition to center when no face detected
-                alpha = min(1.0, (self.no_face_counter - self.max_no_face_frames) / 15)
-                if self.last_valid_position is None:
-                    return self.center_position
-                position = int(self.last_valid_position * (1 - alpha) + self.center_position * alpha)
-                self.position_history.append(position)
-                return position
-            elif self.last_valid_position is not None:
-                self.position_history.append(self.last_valid_position)
-                return self.last_valid_position
-            else:
-                self.position_history.append(self.center_position)
-                return self.center_position
-
-        self.no_face_counter = 0
-
-        # Find the most prominent face with speaker detection
-        best_face = None
-        best_score = -1
-
-        for face in faces:
-            x, y, w, h = face
-            center_x = x + w/2
-            
-            # Enhanced scoring system
-            size_score = (w * h) / (self.frame_width * self.frame_height)
-            center_offset = abs(center_x - self.frame_width/2)
-            center_score = 1 - (center_offset / (self.frame_width/2))
-            vertical_score = 1 - (y / self.frame_height)
-            
-            score = (
-                size_score * 0.5 +
-                center_score * 0.4 +
-                vertical_score * 0.1
-            )
-            
-            if is_speaking:
-                score *= 2.0
-            
-            if score > best_score:
-                best_score = score
-                best_face = face
-
-        if best_score < 0.2:
-            if self.last_valid_position is not None:
-                return self.last_valid_position
-            return self.center_position
-
-        x, y, w, h = best_face
-        face_center = x + w/2
-
-        # Calculate ideal crop position
-        ideal_crop_x = max(0, min(self.frame_width - self.vertical_width,
-                                 face_center - self.vertical_width/2))
-        
-        # Apply margin based on face size
-        margin = w * 0.2
-        if x - margin < ideal_crop_x:
-            ideal_crop_x = max(0, x - margin)
-        elif (x + w + margin) > (ideal_crop_x + self.vertical_width):
-            ideal_crop_x = min(self.frame_width - self.vertical_width,
-                             x + w + margin - self.vertical_width)
-        
-        # If we have a previous position, limit maximum movement per frame
-        if self.last_valid_position is not None:
-            movement = ideal_crop_x - self.last_valid_position
-            if abs(movement) < self.min_movement_threshold:
-                return self.last_valid_position
-                
-            movement = max(-self.max_movement_per_frame, 
-                         min(self.max_movement_per_frame, movement))
-            ideal_crop_x = self.last_valid_position + movement
-        
-        # Ensure ideal_crop_x is a valid number
-        if not isinstance(ideal_crop_x, (int, float)) or np.isnan(ideal_crop_x):
-            return self.center_position if self.last_valid_position is None else self.last_valid_position
-        
-        # Shorter history for weighted average
-        self.position_history.append(ideal_crop_x)
-        if len(self.position_history) >= 3:
-            weights = np.exp(np.linspace(-0.5, 0, len(self.position_history)))
-            weights /= weights.sum()
-            try:
-                smoothed_position = int(np.average(self.position_history, weights=weights))
-            except:
-                smoothed_position = int(ideal_crop_x)
-        else:
-            smoothed_position = int(ideal_crop_x)
-        
-        # Additional boundary check
-        smoothed_position = max(0, min(self.frame_width - self.vertical_width, smoothed_position))
-        
-        self.last_valid_position = smoothed_position
-        return smoothed_position
-
-def detect_faces_and_speakers(input_video_path, output_video_path, frame_interval=1, buffer_time=1.0, debug_visualization=True):
-    """ 
-    Enhanced face detection with better tracking and speaker detection.
-    Works with pre-trimmed video clip, accounting for buffer time.
-    debug_visualization: If True, shows real-time detection visualization and saves debug video
-    """
-    global Frames, face_detector_mp
-    Frames = []
+class VideoProcessor:
+    """Main class for processing videos into YouTube Shorts format"""
     
-    print("\n=== Starting Face Detection Pipeline ===")
-    print(f"Processing trimmed clip: {input_video_path}")
-    print(f"Frame interval: {frame_interval} (processing every {frame_interval}th frame)")
-    print(f"Buffer time: {buffer_time}s at start and end")
-    
-    if face_detector_mp is None:
-        print("Initializing MediaPipe face detector with high confidence threshold...")
-        face_detector_mp = mp_face_detection.FaceDetection(
-            model_selection=1,  # Use full-range model
+    def __init__(self):
+        # Initialize MediaPipe face detection
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detector = self.mp_face_detection.FaceDetection(
+            model_selection=1,
             min_detection_confidence=0.85
         )
-
-    print("\nAnalyzing video properties...")
-    cap = cv2.VideoCapture(input_video_path)
-    if not cap.isOpened():
-        raise Exception("Failed to open video file")
         
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    vertical_width = int(frame_height * 9 / 16)
-    
-    if fps <= 0 or frame_width <= 0 or frame_height <= 0:
-        raise Exception("Invalid video properties detected")
-    
-    # Calculate frame ranges accounting for buffer
-    buffer_frames = int(buffer_time * fps)
-    start_frame = buffer_frames
-    end_frame = total_frames - buffer_frames
-    
-    print(f"\nVideo properties:")
-    print(f"- Total frames: {total_frames}")
-    print(f"- Frames to process: {end_frame - start_frame}")
-    print(f"- Buffer frames: {buffer_frames} at start and end")
-    print(f"- FPS: {fps}")
-    print(f"- Resolution: {frame_width}x{frame_height}")
-    print(f"- Target crop width: {vertical_width}")
-    
-    # Extract audio for voice activity detection from trimmed clip
-    print("\nExtracting audio for voice activity detection...")
-    temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_video_path)), 'temp_files')
-    os.makedirs(temp_files_dir, exist_ok=True)
-    
-    timestamp = int(time.time())
-    temp_audio_path = os.path.join(temp_files_dir, f"temp_audio_{timestamp}.wav")
-    if not extractAudio(input_video_path, temp_audio_path):
-        raise Exception("Failed to extract audio from video")
-
-    print("\nAnalyzing audio for speech detection...")
-    audio = AudioSegment.from_wav(temp_audio_path)
-    samples = np.array(audio.get_array_of_samples())
-    
-    chunk_duration_ms = 30
-    chunk_size = int(audio.frame_rate * chunk_duration_ms / 1000)
-    voice_activities = []
-    
-    # Only process audio for non-buffer region
-    start_sample = int(buffer_time * audio.frame_rate)
-    end_sample = len(samples) - int(buffer_time * audio.frame_rate)
-    samples = samples[start_sample:end_sample]
-    
-    total_chunks = len(samples) // chunk_size
-    print(f"Processing {total_chunks} audio chunks (excluding buffer regions)...")
-    
-    # Compute mean energy once for the entire sample
-    mean_energy = np.mean(samples ** 2)
-    
-    for i in range(0, len(samples), chunk_size):
-        chunk = samples[i:i + chunk_size]
-        if len(chunk) == chunk_size:
-            energy = np.sum(chunk ** 2) / len(chunk)
-            is_speech = energy > mean_energy * 1.5
-            voice_activities.append(is_speech)
-
-    print("\nStarting face detection analysis...")
-    tracker = FaceTracker(frame_width, frame_height, vertical_width)
-    frame_count = 0
-    face_detected_count = 0
-    last_progress = 0
-    
-    # Setup debug video writer if enabled
-    debug_writer = None
-    if debug_visualization:
-        cv2.namedWindow('Face and Speaker Detection Debug', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Face and Speaker Detection Debug', 960, 540)
+        # Initialize device for processing
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        debug_output_path = os.path.join(
-            os.path.dirname(os.path.dirname(output_video_path)),
-            'finished_videos',
-            f"debug_{os.path.basename(output_video_path)}"
-        )
-        print(f"\nSaving debug visualization to: {debug_output_path}")
+        # Speaker detection parameters
+        self.speaking_window = 15  # frames
+        self.speaking_history = deque(maxlen=self.speaking_window)
+         
+        # Face tracking parameters
+        self.tracking_window = 30  # frames
+        self.position_history = deque(maxlen=self.tracking_window)
         
-        debug_writer = cv2.VideoWriter(
-            debug_output_path,
+        # Set up paths
+        self.project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.temp_dir = os.path.join(self.project_dir, "temp_files")
+        self.finished_dir = os.path.join(self.project_dir, "finished_videos")
+        
+        # Ensure directories exist
+        os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(self.finished_dir, exist_ok=True)
+        
+    def detect_face_and_crop(self, video_path: str, start: float, end: float) -> str:
+        """
+        Main entry point for processing a video segment into YouTube Shorts format.
+        
+        Args:
+            video_path: Path to the source video
+            start: Start timestamp in seconds
+            end: End timestamp in seconds
+            
+        Returns:
+            Path to the processed video file in finished_videos directory
+        """
+        try:
+            print("\n=== Starting Video Processing Pipeline ===")
+            duration = end - start
+            file_hash = os.path.splitext(os.path.basename(video_path))[0]
+            
+            # Define output paths
+            temp_clip_path = os.path.join(self.temp_dir, f"{file_hash}_temp_clip_{start:.2f}_{end:.2f}.mp4")
+            debug_output_path = os.path.join(self.finished_dir, f"{file_hash}_debug_{start:.2f}_{end:.2f}.mp4")
+            final_output_path = os.path.join(self.finished_dir, f"{file_hash}_short_{start:.2f}_{end:.2f}.mp4")
+            
+            print("Step 1: Extracting working clip...")
+            # Step 1: Extract working clip
+            temp_clip_path = self._extract_temp_clip(
+                video_path, start, duration, temp_clip_path
+            )
+            
+            print("Step 2: Pre-analyzing video...")
+            # Step 2: Pre-analyze the video for speech and face positions
+            analyzer = SpeechAndFaceAnalyzer()
+            cap = cv2.VideoCapture(temp_clip_path)
+            fps = int(cap.get(5))  # cv2.CAP_PROP_FPS is 5
+            cap.release()
+            
+            analysis = analyzer.analyze_video(temp_clip_path, fps)
+            
+            print("Step 3: Processing frames with analysis...")
+            # Step 3: Process the video frames using the analysis data
+            processed_frames = self._process_video_with_analysis(temp_clip_path, analysis)
+            
+            if not processed_frames:
+                raise ValueError("No frames were processed")
+            
+            print("Step 4: Generating debug visualization...")
+            # Step 4: Generate debug visualization
+            debug_path = self._create_debug_video(
+                temp_clip_path,
+                processed_frames,
+                debug_output_path
+            )
+            
+            print("Step 5: Creating final cropped video...")
+            # Step 5: Create final cropped video
+            final_path = self._create_final_video(
+                temp_clip_path,
+                processed_frames,
+                final_output_path
+            )
+            
+            # Clean up temporary files
+            if os.path.exists(temp_clip_path):
+                os.remove(temp_clip_path)
+                print("Cleaned up temporary files")
+            
+            print("Video processing complete!")
+            return final_output_path
+                
+        except Exception as e:
+            print(f"Error in detect_face_and_crop: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+            
+    def _extract_temp_clip(self, video_path: str, start: float, duration: float, output_path: str) -> str:
+        """Extract working segment from the main video"""
+        try:
+            # Use MoviePy to extract the segment
+            with VideoFileClip(video_path) as video:
+                clip = video.subclip(start, start + duration)
+                clip.write_videofile(output_path, codec='libx264', audio_codec='aac')
+                
+            return output_path
+            
+        except Exception as e:
+            print(f"Error extracting temp clip: {str(e)}")
+            raise
+            
+    def _process_video(self, video_path: str) -> List[Dict]:
+        """Process video frames for face detection and speaker detection"""
+        processed_frames = []
+        
+        cap = cv2.VideoCapture(video_path)
+        fps = int(cap.get(5))  # cv2.CAP_PROP_FPS is 5
+        frame_width = int(cap.get(3))  # cv2.CAP_PROP_WIDTH is 3
+        frame_height = int(cap.get(4))  # cv2.CAP_PROP_HEIGHT is 4
+        
+        # Calculate target width to ensure it's divisible by 2
+        raw_target_width = int(frame_height * 9 / 16)
+        target_width = raw_target_width if raw_target_width % 2 == 0 else raw_target_width + 1
+        
+        # Initialize speaker detector
+        speaker_detector = self.SpeakerDetector(video_path, fps)
+        
+        # Process frames
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Detect faces
+            faces = self._detect_faces(frame)
+            
+            # Check for speaking activity
+            is_speaking = speaker_detector.is_speaking_at_frame(frame_idx)
+            
+            # Calculate optimal crop position ensuring final width is even
+            crop_x = self._calculate_crop_position(
+                faces, is_speaking, frame_width, target_width
+            )
+            # Ensure crop_x is even to maintain even pixel alignment
+            crop_x = crop_x - (crop_x % 2)
+            
+            processed_frames.append({
+                'frame_idx': frame_idx,
+                'faces': faces,
+                'is_speaking': is_speaking,
+                'crop_x': crop_x,
+                'frame_width': frame_width,
+                'frame_height': frame_height,
+                'target_width': target_width
+            })
+            
+            frame_idx += 1
+            
+        cap.release()
+        return processed_frames
+        
+    def _detect_faces(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Detect faces in a frame using MediaPipe"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_detector.process(rgb_frame)
+        
+        faces = []
+        if results.detections:
+            for detection in results.detections:
+                bbox = detection.location_data.relative_bounding_box
+                h, w, _ = frame.shape
+                x = int(bbox.xmin * w)
+                y = int(bbox.ymin * h)
+                width = int(bbox.width * w)
+                height = int(bbox.height * h)
+                faces.append((x, y, width, height))
+                
+        return faces
+        
+    def _calculate_crop_position(
+        self, 
+        faces: List[Tuple[int, int, int, int]], 
+        is_speaking: bool,
+        frame_width: int,
+        target_width: int
+    ) -> int:
+        """Calculate optimal crop position using sliding window technique"""
+        if not faces:
+            return self.position_history[-1] if self.position_history else (frame_width - target_width) // 2
+            
+        # First pass: calculate base scores for all faces
+        face_scores = []
+        for face in faces:
+            x, y, w, h = face
+            face_center = x + (w // 2)
+            
+            # Calculate crop position to center the face
+            potential_crop_x = max(0, min(
+                frame_width - target_width,  # Don't exceed frame bounds
+                face_center - (target_width // 2)  # Center face in crop window
+            ))
+            
+            # Adjust crop position if face would be cut off
+            face_left = x
+            face_right = x + w
+            crop_right = potential_crop_x + target_width
+            
+            # If face would be cut off on either side, adjust the crop position
+            if face_left < potential_crop_x:
+                # Face being cut off on left side, move crop left
+                potential_crop_x = max(0, face_left)
+            elif face_right > crop_right:
+                # Face being cut off on right side, move crop right
+                potential_crop_x = min(frame_width - target_width, face_right - target_width)
+            
+            # Calculate visibility after adjustments
+            crop_right = potential_crop_x + target_width
+            visible_left = max(face_left, potential_crop_x)
+            visible_right = min(face_right, crop_right)
+            
+            if visible_right > visible_left:
+                visibility_ratio = (visible_right - visible_left) / w
+                # Base score considers size and visibility
+                score = (w * h) * visibility_ratio
+                # Position score based on centering
+                center_offset = abs(face_center - (potential_crop_x + target_width/2)) / target_width
+                position_score = 1 - center_offset
+                score *= position_score
+                
+                # Add speaking bonus
+                if is_speaking:
+                    score *= 4.0  # Increased speaking bonus
+                
+                face_scores.append({
+                    'face': face,
+                    'score': score,
+                    'center': face_center,
+                    'crop_x': potential_crop_x
+                })
+        
+        if not face_scores:
+            return self.position_history[-1] if self.position_history else (frame_width - target_width) // 2
+        
+        # Second pass: adjust scores based on group positioning
+        for i, face_data in enumerate(face_scores):
+            group_bonus = 0
+            main_face_center = face_data['center']
+            
+            # Check if this crop position would include other faces
+            for other_face_data in face_scores:
+                if other_face_data != face_data:
+                    other_center = other_face_data['center']
+                    # Calculate if other face would be visible in this crop
+                    if (abs(other_center - main_face_center) <= target_width * 0.8):
+                        group_bonus += other_face_data['score'] * 0.3  # 30% bonus for including additional faces
+            
+            face_data['score'] += group_bonus
+        
+        # Select best scoring face/position
+        best_face_data = max(face_scores, key=lambda x: x['score'])
+        crop_x = best_face_data['crop_x']
+        
+        # Apply temporal smoothing
+        self.position_history.append(crop_x)
+        if is_speaking:
+            # More aggressive smoothing for speaking faces
+            alpha = 0.8  # Increased from 0.7 for faster response to speaking faces
+            smoothed_x = int(alpha * crop_x + (1 - alpha) * np.mean(list(self.position_history)[:-1]))
+        else:
+            # Gentler smoothing for non-speaking faces
+            smoothed_x = int(np.mean(self.position_history))
+        
+        # Ensure the smoothed position doesn't cut off the primary face
+        primary_face = best_face_data['face']
+        x, _, w, _ = primary_face
+        face_left = x
+        face_right = x + w
+        
+        if face_left < smoothed_x:
+            smoothed_x = max(0, face_left)
+        elif face_right > smoothed_x + target_width:
+            smoothed_x = min(frame_width - target_width, face_right - target_width)
+        
+        return smoothed_x
+        
+    def _create_debug_video(
+        self, 
+        video_path: str,
+        processed_frames: List[Dict],
+        output_path: str
+    ) -> str:
+        """Create debug visualization video"""
+        if not processed_frames:
+            return None
+            
+        cap = cv2.VideoCapture(video_path)
+        frame_width = processed_frames[0]['frame_width']
+        frame_height = processed_frames[0]['frame_height']
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        writer = cv2.VideoWriter(
+            output_path,
             cv2.VideoWriter_fourcc(*'mp4v'),
             fps,
             (frame_width, frame_height)
         )
-    
-    # Default frame data for when no faces are detected
-    default_frame_data = [frame_width // 2 - vertical_width // 2, 0, vertical_width, frame_height]
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        is_in_buffer = frame_count < buffer_frames or frame_count >= (total_frames - buffer_frames)
         
-        # Progress update every 5%
-        progress = ((frame_count - buffer_frames) / (end_frame - start_frame)) * 100
-        if not is_in_buffer and int(progress) > last_progress and progress % 5 == 0:
-            print(f"Processing: {int(progress)}% complete (frame {frame_count - buffer_frames}/{end_frame - start_frame})")
-            print(f"Faces detected so far: {face_detected_count}")
-            last_progress = int(progress)
-
-        voice_activity_index = int((frame_count - buffer_frames) * chunk_duration_ms / (1000 / fps))
-        is_speaking = False
-        if not is_in_buffer and 0 <= voice_activity_index < len(voice_activities):
-            is_speaking = voice_activities[voice_activity_index]
-
-        current_faces = []
-        debug_frame = frame.copy() if debug_visualization else None
-        
-        if frame_count % frame_interval == 0 and not is_in_buffer:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_detector_mp.process(frame_rgb)
-
-            if results.detections:
-                for detection in results.detections:
-                    if detection.score[0] > 0.85:
-                        bbox = detection.location_data.relative_bounding_box
-                        x = int(bbox.xmin * frame_width)
-                        y = int(bbox.ymin * frame_height)
-                        w = int(bbox.width * frame_width)
-                        h = int(bbox.height * frame_height)
-                        
-                        if (w * h) / (frame_width * frame_height) > 0.01:
-                            current_faces.append([x, y, w, h])
-                            face_detected_count += 1
-                            
-                            if debug_visualization:
-                                cv2.rectangle(debug_frame, (x, y), (x + w, y + h), 
-                                           (0, 255, 0) if is_speaking else (0, 165, 255), 2)
-                                
-                                status_text = f"Speaking: {is_speaking}"
-                                conf_text = f"Conf: {detection.score[0]:.2f}"
-                                
-                                cv2.putText(debug_frame, status_text, (x, y - 25),
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
-                                          (0, 255, 0) if is_speaking else (0, 165, 255), 2)
-                                cv2.putText(debug_frame, conf_text, (x, y - 10),
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
-                                          (0, 255, 0) if is_speaking else (0, 165, 255), 2)
-
-        crop_x = tracker.update(current_faces, is_speaking)
-        if crop_x is None:  # Handle case where tracker returns None
-            frame_data = default_frame_data
-        else:
-            frame_data = [int(crop_x), 0, vertical_width, frame_height]
-            
-        if not is_in_buffer:
-            Frames.append(frame_data)
-            
-            if debug_visualization:
-                cv2.rectangle(debug_frame, 
-                            (frame_data[0], 0), 
-                            (frame_data[0] + frame_data[2], frame_height),
-                            (255, 0, 0), 2)
-                            
-        if debug_visualization:
-            cv2.imshow('Face and Speaker Detection Debug', debug_frame)
-            debug_writer.write(debug_frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
                 break
                 
-        frame_count += 1
-
-    cap.release()
-    if debug_visualization:
-        if debug_writer:
-            debug_writer.release()
-        cv2.destroyAllWindows()
-        print(f"\nDebug visualization saved to: {debug_output_path}")
-    
-    # Cleanup temp audio file
-    if os.path.exists(temp_audio_path):
-        try:
-            os.remove(temp_audio_path)
-            print(f"Cleaned up temporary audio file: {temp_audio_path}")
-        except Exception as e:
-            print(f"Warning: Could not remove temporary audio file: {e}")
-
-    if not Frames:  # If no frames were processed, use default center crop
-        print("\nWarning: No face tracking data generated, using center crop")
-        Frames = [default_frame_data] * (end_frame - start_frame)
-
-    print("\n=== Face Detection Complete ===")
-    print(f"Total frames analyzed: {end_frame - start_frame}")
-    print(f"Total faces detected: {face_detected_count}")
-    if end_frame - start_frame > 0:
-        print(f"Face detection rate: {(face_detected_count/(end_frame - start_frame))*100:.2f}%")
-    return Frames
-
-def ensure_valid_crop_window(x_start, x_end, vertical_width, original_width):
-    if x_end > original_width:
-        x_end = original_width
-        x_start = max(0, x_end - vertical_width)
-    if x_start < 0:
-        x_start = 0
-        x_end = min(original_width, vertical_width)
-    return x_start, x_end
-
-def detect_face_and_crop(video_path, output_path, start_time, end_time, debug_visualization=True):
-    global face_detector_mp, Frames
-    try:
-        print("\n=== Starting Video Processing Pipeline ===")
-        print(f"Processing segment from {start_time}s to {end_time}s")
-        
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Input video not found: {video_path}")
-        
-        # Initialize frames list
-        Frames = []
-        
-        # Get video properties first
-        cap = cv2.VideoCapture(video_path)
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        
-        # Create temporary directory and get temp files path
-        base_dir = os.path.dirname(os.path.dirname(output_path))
-        temp_files_dir = os.path.join(base_dir, 'temp_files')
-        os.makedirs(temp_files_dir, exist_ok=True)
-        
-        # Register temporary directory with cleanup system
-        if 'register_temp_file' in globals():
-            register_temp_file(temp_files_dir)
-        
-        # Create temporary clip for processing with 1 second buffer
-        buffer_time = 1.0
-        timestamp = int(time.time())
-        temp_clip_path = os.path.join(temp_files_dir, f"temp_clip_for_detection_{timestamp}.mp4")
-        
-        # Register temp clip for cleanup
-        if 'register_temp_file' in globals():
-            register_temp_file(temp_clip_path)
-        
-        duration = end_time - start_time
-        print(f"Adding {buffer_time}s buffer to start and end for processing")
-        
-        # Create temp clip with buffer
-        success, adjusted_start_time = create_temp_clip(
-            video_path, 
-            temp_clip_path, 
-            start_time,
-            duration,
-            buffer=buffer_time
-        )
-        
-        if not success:
-            raise Exception("Failed to create temporary clip")
-            
-        if not os.path.exists(temp_clip_path):
-            raise FileNotFoundError(f"Temporary clip not found after creation: {temp_clip_path}")
-        
-        print("\nBeginning face detection on temporary clip...")
-        detect_faces_and_speakers(temp_clip_path, output_path, buffer_time=buffer_time, debug_visualization=debug_visualization)
-        
-        # Validate that we have enough frame data
-        if not Frames:
-            raise Exception("No face tracking data generated during detection")
-        
-        print(f"Face detection complete. Generated {len(Frames)} frame positions.")
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Process final video segment
-        print("\nProcessing final video segment...")
-        success = process_video_segment(
-            temp_clip_path,
-            output_path,
-            buffer_time,
-            duration,
-            Frames[0][0] if Frames else 0,  # Use first frame's x position or 0
-            Frames[0][2] if Frames else int(frame_height * 9/16),  # Use first frame's width or calculate
-            Frames[0][3] if Frames else frame_height,  # Use first frame's height or original
-            total_clip_duration=duration + (buffer_time * 2)
-        )
-        
-        if not success:
-            raise Exception("Failed to process final video segment")
-            
-        if not os.path.exists(output_path):
-            raise FileNotFoundError(f"Final processed video not found: {output_path}")
-        
-        return True
-
-    except Exception as e:
-        print(f"\nError in detect_face_and_crop: {str(e)}")
-        print("\nFile status:")
-        print(f"Input video exists: {os.path.exists(video_path)}")
-        if 'temp_clip_path' in locals():
-            print(f"Temp clip exists: {os.path.exists(temp_clip_path)}")
-        print(f"Output path exists: {os.path.exists(output_path)}")
-        print(f"Number of tracked frames: {len(Frames)}")
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except:
-                pass
-        return False
-
-def cleanup_resources():
-    global face_detector_mp
-    if face_detector_mp:
-        face_detector_mp = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-def get_hardware_encoder():
-    try:
-        nvidia_output = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
-        if nvidia_output.returncode == 0:
-            ffmpeg_output = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
-            if 'h264_nvenc' in ffmpeg_output.stdout:
-                return 'h264_nvenc'
-    except:
-        pass
-    return 'libx264'
-
-def interpolate_positions(frame_positions, max_movement=30, smoothing_window=7):
-    """Enhanced smoothing of frame-to-frame movements using Gaussian smoothing"""
-    if not frame_positions:
-        return []
-        
-    smoothed = []
-    positions = np.array([pos[0] for pos in frame_positions])
-    
-    # Create Gaussian kernel for smoothing
-    kernel = np.exp(-0.5 * np.square(np.linspace(-2, 2, smoothing_window)))
-    kernel = kernel / np.sum(kernel)
-    
-    # Pad the positions array for smoothing at edges
-    pad_width = smoothing_window // 2
-    padded_positions = np.pad(positions, (pad_width, pad_width), mode='edge')
-    
-    # Apply Gaussian smoothing
-    smoothed_x = np.zeros_like(positions)
-    for i in range(len(positions)):
-        window = padded_positions[i:i + smoothing_window]
-        smoothed_x[i] = np.sum(window * kernel)
-    
-    # Limit frame-to-frame movement
-    limited_x = np.zeros_like(smoothed_x)
-    limited_x[0] = smoothed_x[0]
-    for i in range(1, len(smoothed_x)):
-        movement = smoothed_x[i] - limited_x[i-1]
-        if abs(movement) > max_movement:
-            limited_x[i] = limited_x[i-1] + np.sign(movement) * max_movement
-        else:
-            limited_x[i] = smoothed_x[i]
-    
-    # Reconstruct frame data with smoothed x positions
-    for i, (x, original) in enumerate(zip(limited_x, frame_positions)):
-        smoothed.append([int(x), original[1], original[2], original[3]])
-    
-    return smoothed
-
-def preview_tracking(frame, x, width, height, is_speaking=False, return_frame=False):
-    """
-    Helper function to show tracking preview
-    return_frame: If True, returns the preview frame instead of showing it
-    """
-    preview = frame.copy()
-    # Draw crop region
-    cv2.rectangle(preview, 
-                 (int(x), 0), 
-                 (int(x + width), height),
-                 (255, 0, 0), 2)
-    
-    # Add tracking info
-    cv2.putText(preview, f"Crop X: {int(x)}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    cv2.putText(preview, f"Width: {width}", (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
-    if return_frame:
-        return preview
-        
-    # Show preview
-    cv2.imshow('Processing Preview', preview)
-    cv2.waitKey(1)
-
-def process_video_segment(input_path, output_path, start_time, duration, crop_x, output_width, output_height, total_clip_duration=None):
-    try:
-        print("\n=== Starting Video Processing ===")
-        print(f"Input: {input_path}")
-        print(f"Output: {output_path}")
-        if total_clip_duration:
-            print(f"Total clip duration (with buffer): {total_clip_duration}s")
-            print(f"Processing segment: {start_time}s to {start_time + duration}s (removing buffer)")
-        print(f"Final output duration: {duration}s")
-        print(f"Crop window: {output_width}x{output_height} at x={crop_x}")
-
-        if not os.path.exists(input_path):
-            raise Exception(f"Input file does not exist: {input_path}")
-
-        temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_path)), 'temp_files')
-        os.makedirs(temp_files_dir, exist_ok=True)
-        
-        timestamp = int(time.time())
-        temp_output = os.path.join(temp_files_dir, f"temp_output_{timestamp}.mp4")
-        
-        encoder = get_hardware_encoder()
-        print(f"\nUsing video encoder: {encoder}")
-        print("Starting FFmpeg processing...")
-
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-ss', str(start_time),  # Start after buffer
-            '-i', input_path,
-            '-t', str(duration),     # Only take original duration
-            '-filter_complex', f'[0:v]crop={output_width}:{output_height}:{crop_x}:0,scale=1080:1920[v]',
-            '-map', '[v]',
-            '-map', '0:a',
-            '-c:v', encoder
-        ]
-
-        if encoder == 'h264_nvenc':
-            ffmpeg_cmd.extend(['-preset', 'p4', '-rc', 'vbr', '-cq', '23', '-b:v', '5M'])
-        else:
-            ffmpeg_cmd.extend(['-preset', 'veryfast', '-crf', '23'])
-
-        ffmpeg_cmd.extend([
-            '-c:a', 'aac',
-            '-b:a', '192k',
-            '-ac', '2',
-            '-ar', '44100',
-            '-movflags', '+faststart',
-            temp_output
-        ])
-
-        process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        
-        if process.returncode != 0:
-            raise Exception(f"FFmpeg process failed: {process.stderr}")
-
-        if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            os.rename(temp_output, output_path)
-            print(f"\nVideo processing complete: {output_path}")
-            return True
-        else:
-            raise Exception("Output file is missing or empty")
-
-    except Exception as e:
-        print(f"Error during video processing: {str(e)}")
-        if os.path.exists(temp_output):
-            try:
-                os.remove(temp_output)
-            except:
-                pass
-        return False
-
-    finally:
-        temp_files_dir = os.path.join(os.path.dirname(os.path.dirname(output_path)), 'temp_files')
-        if os.path.exists(temp_files_dir):
-            try:
-                for file in os.listdir(temp_files_dir):
-                    if file.startswith('temp_output_'):
-                        try:
-                            os.remove(os.path.join(temp_files_dir, file))
-                        except:
-                            pass
-            except:
-                pass
-
-def process_chunk(input_path, output_path, start_time, duration, frames, frame_width, frame_height, fps, encoder):
-    """Process a smaller chunk of the video to manage memory usage"""
-    try:
-        filter_complex = []
-        for i, (x, y, w, h) in enumerate(frames):
-            # Validate and clamp values
-            x = max(0, min(frame_width - w, x))
-            y = max(0, min(frame_height - h, y))
-            w = min(frame_width - x, w)
-            h = min(frame_height - y, h)
-            
-            pts = f"PTS-STARTPTS" if i == 0 else f"PTS-STARTPTS+{i/fps:.3f}/TB"
-            filter_complex.append(f"[0:v]trim=start_frame={int(start_time * fps) + i}:end_frame={int(start_time * fps) + i + 1},setpts={pts},crop={w}:{h}:{x}:{y}[v{i}]")
-        
-        # Add concatenation filter
-        v_labels = ''.join(f"[v{i}]" for i in range(len(frames)))
-        filter_complex.append(f"{v_labels}concat=n={len(frames)}:v=1[outv]")
-        
-        # Join filters with semicolons
-        filter_str = ';'.join(filter for filter in filter_complex if filter.strip())
-        
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-i', input_path,
-            '-filter_complex', filter_str,
-            '-map', '[outv]',
-            '-map', '0:a',
-            '-ss', str(start_time),
-            '-t', str(duration),
-            '-c:v', encoder
-        ]
-
-        if encoder == 'h264_nvenc':
-            ffmpeg_cmd.extend([
-                '-preset', 'p4',
-                '-rc', 'vbr',
-                '-cq', '23',
-                '-b:v', '5M',
-                '-maxrate', '10M',
-                '-bufsize', '10M'
-            ])
-        else:
-            ffmpeg_cmd.extend([
-                '-preset', 'veryfast',
-                '-crf', '23'
-            ])
-
-        ffmpeg_cmd.extend([
-            '-c:a', 'aac',
-            '-b:a', '192k',
-            '-ac', '2',
-            '-ar', '44100',
-            '-movflags', '+faststart',
-            output_path
-        ])
-
-        process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
-        if process.returncode != 0:
-            print(f"\nFFmpeg Chunk Error Output:")
-            print(process.stderr)
-            return False
-            
-        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
-            return False
-            
-        return True
-        
-    except Exception as e:
-        print(f"Error processing chunk: {str(e)}")
-        return False
-
-def voice_activity_detection(audio_frame, sample_rate=16000):
-    """Detect voice activity in an audio frame"""
-    try:
-        # Simple energy-based voice activity detection
-        frame = np.frombuffer(audio_frame, dtype=np.int16)
-        energy = np.sum(frame.astype(np.float32) ** 2) / len(frame)
-        threshold = 100000  # Adjust this threshold based on your needs
-        return energy > threshold
-    except Exception as e:
-        print(f"Error in voice activity detection: {e}")
-        return False
-
-def analyze_audio_for_speech(audio_path, chunk_duration_ms=30):
-    """Analyze audio file for speech segments"""
-    try:
-        audio = AudioSegment.from_file(audio_path)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        samples = np.array(audio.get_array_of_samples())
-        
-        chunk_size = int(audio.frame_rate * chunk_duration_ms / 1000)
-        voice_activities = []
-        
-        # Calculate average energy for normalization
-        mean_energy = np.mean(samples ** 2)
-        
-        for i in range(0, len(samples), chunk_size):
-            chunk = samples[i:i + chunk_size]
-            if len(chunk) == chunk_size:
-                energy = np.sum(chunk ** 2) / len(chunk)
-                is_speech = energy > mean_energy * 1.5
-                voice_activities.append(is_speech)
+            if frame_idx >= len(processed_frames):
+                break
                 
-        return voice_activities
-    except Exception as e:
-        print(f"Error analyzing audio: {e}")
-        return []
-
-def preview_and_save_debug_frame(frame, faces, is_speaking, crop_x, vertical_width, frame_height, debug_writer=None):
-    """Create and optionally save a debug visualization frame"""
-    debug_frame = frame.copy()
-    
-    # Draw faces
-    for face in faces:
-        x, y, w, h = face
-        color = (0, 255, 0) if is_speaking else (0, 165, 255)
-        cv2.rectangle(debug_frame, (x, y), (x + w, y + h), color, 2)
+            frame_data = processed_frames[frame_idx]
+            debug_frame = self._create_debug_frame(frame, frame_data)
+            writer.write(debug_frame)
+            frame_idx += 1
+            
+        cap.release()
+        writer.release()
+        return output_path
         
-        # Add speaking status
-        status_text = f"Speaking: {is_speaking}"
-        cv2.putText(debug_frame, status_text, (x, y - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    
-    # Draw crop region
-    cv2.rectangle(debug_frame, 
-                 (int(crop_x), 0), 
-                 (int(crop_x + vertical_width), frame_height),
-                 (255, 0, 0), 2)
-    
-    # Add crop position info
-    cv2.putText(debug_frame, f"Crop X: {int(crop_x)}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
-    # Save frame if writer is provided
-    if debug_writer is not None:
-        debug_writer.write(debug_frame)
-    
-    return debug_frame
+    def _create_debug_frame(self, frame: np.ndarray, frame_data: Dict) -> np.ndarray:
+        """Create a debug visualization frame"""
+        debug_frame = frame.copy()
+        
+        # Draw faces
+        for face in frame_data['faces']:
+            x, y, w, h = face
+            color = (0, 165, 255)  # Orange color for all boxes
+            cv2.rectangle(debug_frame, (x, y), (x + w, y + h), color, 2)
+            
+            # Add "ACTIVE" text above speaking faces
+            if frame_data['is_speaking']:
+                text = "ACTIVE"
+                # Get text size to center it above the box
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                text_x = x + (w - text_size[0]) // 2
+                text_y = max(y - 10, text_size[1])  # Ensure text doesn't go above frame
+                cv2.putText(debug_frame, text, (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)  # Green text
+            
+        # Draw current crop region (blue)
+        cv2.rectangle(
+            debug_frame,
+            (frame_data['crop_x'], 0),
+            (frame_data['crop_x'] + frame_data['target_width'], frame_data['frame_height']),
+            (255, 0, 0), 2
+        )
+        
+        # Draw target position indicator (red line) if in transition
+        if frame_data.get('transition_frames', 0) > 0:
+            target_x = frame_data.get('current_target', 0)
+            cv2.line(
+                debug_frame,
+                (target_x, 0),
+                (target_x, frame_data['frame_height']),
+                (0, 0, 255), 2  # Red color
+            )
+            # Add transition progress text
+            progress = 1 - (frame_data['transition_frames'] / (frame_data['frame_height'] * 0.5))
+            cv2.putText(
+                debug_frame,
+                f"Transition: {progress:.1%}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 0, 255),
+                2
+            )
+        
+        return debug_frame
+        
+    def _create_final_video(
+        self,
+        input_path: str,
+        processed_frames: List[Dict],
+        output_path: str
+    ) -> str:
+        """Create the final cropped video using MoviePy"""
+        try:
+            with VideoFileClip(input_path) as video:
+                # Create a dynamic cropping function
+                frame_idx = [0]  # Use list to maintain state
+                
+                def dynamic_crop(get_frame, t):
+                    frame = get_frame(t)
+                    if frame_idx[0] < len(processed_frames):
+                        frame_data = processed_frames[frame_idx[0]]
+                        crop_x = frame_data['crop_x']
+                        target_width = frame_data['target_width']
+                        frame_idx[0] += 1
+                        # Ensure the cropped width is even
+                        if target_width % 2 != 0:
+                            target_width -= 1
+                        return frame[:, crop_x:crop_x + target_width]
+                    return frame
+                    
+                # Apply dynamic cropping
+                final_clip = video.fl(dynamic_crop)
+                
+                # Write final video ensuring codec parameters are correct
+                final_clip.write_videofile(
+                    output_path,
+                    codec='libx264',
+                    audio_codec='aac',
+                    bitrate='2500k',
+                    fps=video.fps,
+                    preset='fast',
+                    threads=4,
+                    ffmpeg_params=['-pix_fmt', 'yuv420p']  # Ensure compatible pixel format
+                )
+                
+            return output_path
+            
+        except Exception as e:
+            print(f"Error creating final video: {str(e)}")
+            return None
+            
+    def _process_video_with_analysis(self, video_path: str, analysis: Dict) -> List[Dict]:
+        """Process video frames using pre-analysis data"""
+        processed_frames = []
+        
+        cap = cv2.VideoCapture(video_path)
+        frame_width = int(cap.get(3))
+        frame_height = int(cap.get(4))
+        fps = int(cap.get(5))
+        
+        # Calculate target width for 9:16 aspect ratio
+        raw_target_width = int(frame_height * 9 / 16)
+        target_width = raw_target_width if raw_target_width % 2 == 0 else raw_target_width + 1
+        
+        # Initialize position tracking
+        current_position = frame_width // 2 - target_width // 2  # Start in center
+        target_position = current_position
+        transition_frames_left = 0
+        max_transition_frames = int(fps * 0.5)  # 0.5 second transition
+        current_focus_point_idx = 0
+        
+        # Sort focus points by start frame
+        focus_points = sorted(analysis['focus_points'], key=lambda x: x['start_frame'])
+        
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Get current face positions
+            faces = self._detect_faces(frame)
+            
+            # Update focus point if needed
+            while (current_focus_point_idx < len(focus_points) and 
+                   frame_idx >= focus_points[current_focus_point_idx]['start_frame']):
+                next_focus = focus_points[current_focus_point_idx]
+                target_position = next_focus['target_position']
+                
+                # Reset transition counter based on transition type
+                if next_focus['transition'] == 'cut':
+                    current_position = target_position
+                    transition_frames_left = 0
+                else:
+                    transition_frames_left = max_transition_frames
+                
+                current_focus_point_idx += 1
+            
+            # Calculate crop position with smooth transitions
+            if transition_frames_left > 0:
+                # Use easing function for smoother motion
+                progress = 1 - (transition_frames_left / max_transition_frames)
+                # Apply cubic easing
+                eased_progress = progress * progress * (3 - 2 * progress)
+                current_position = int(
+                    current_position + (target_position - current_position) * eased_progress
+                )
+                transition_frames_left -= 1
+            
+            # Ensure crop position is valid and even
+            crop_x = max(0, min(frame_width - target_width, current_position))
+            crop_x = crop_x - (crop_x % 2)
+            
+            # Get speaking status
+            is_speaking = frame_idx < len(analysis['speaking_frames']) and analysis['speaking_frames'][frame_idx]
+            
+            processed_frames.append({
+                'frame_idx': frame_idx,
+                'faces': faces,
+                'is_speaking': is_speaking,
+                'crop_x': crop_x,
+                'frame_width': frame_width,
+                'frame_height': frame_height,
+                'target_width': target_width,
+                'current_target': target_position,  # Add for debugging
+                'transition_frames': transition_frames_left  # Add for debugging
+            })
+            
+            frame_idx += 1
+        
+        cap.release()
+        return processed_frames
 
-def create_debug_video_writer(output_path, frame_width, frame_height, fps):
-    """Create a video writer for debug visualization"""
-    debug_output_path = os.path.join(
-        os.path.dirname(os.path.dirname(output_path)),
-        'finished_videos',
-        f"debug_{os.path.basename(output_path)}"
-    )
-    
-    writer = cv2.VideoWriter(
-        debug_output_path,
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        fps,
-        (frame_width, frame_height)
-    )
-    
-    return writer, debug_output_path
+    class SpeakerDetector:
+        """Helper class for detecting speaking activity in videos"""
+        
+        def __init__(self, video_path: str, fps: int):
+            self.fps = fps
+            self.speaking_frames = self._analyze_audio(video_path)
+            
+        def get_speaking_frames(self) -> List[bool]:
+            """Get the list of speaking frame indicators"""
+            return self.speaking_frames
 
-def register_temp_file(filepath):
-    """
-    Register a file for manual cleanup. This no longer triggers automatic cleanup,
-    instead it just tracks files that need to be cleaned up when processing is complete.
-    """
-    global _temp_files_created
-    if '_temp_files_created' not in globals():
-        global _temp_files_created
-        _temp_files_created = set()
-    _temp_files_created.add(filepath)
-    return filepath
+        def _analyze_audio(self, video_path: str) -> List[bool]:
+            """Analyze audio to detect speaking frames using enhanced detection"""
+            try:
+                with VideoFileClip(video_path) as video:
+                    audio = video.audio
+                    if (audio is None) or (audio.duration == 0):
+                        print("No audio stream found in clip")
+                        return [False]
+                    
+                    try:
+                        # Create a temporary WAV file
+                        temp_audio_path = os.path.splitext(video_path)[0] + "_temp_audio.wav"
+                        audio.write_audiofile(temp_audio_path, fps=16000)
+                        
+                        # Load audio using librosa directly
+                        try:
+                            samples, sr = librosa.load(temp_audio_path, sr=16000, mono=True)
+                            
+                            # Clean up temp file
+                            if os.path.exists(temp_audio_path):
+                                os.remove(temp_audio_path)
+                                
+                        except Exception as e:
+                            print(f"Error loading audio with librosa: {str(e)}")
+                            return [False]
+                            
+                    except Exception as e:
+                        print(f"Error extracting audio to WAV: {str(e)}")
+                        return [False]
+                    
+                # Calculate frame-level features with overlap for better precision
+                frame_length = int(16000 / self.fps)  # samples per video frame
+                hop_length = frame_length // 2  # 50% overlap for more precise detection
+                energies = []
+                zero_crossings = []
+                spectral_centroids = []
+                
+                # Process audio in frames with overlap
+                for i in range(0, len(samples) - frame_length, hop_length):
+                    frame = samples[i:i + frame_length]
+                    if len(frame) == frame_length:
+                        # Calculate energy (RMS)
+                        energy = np.sqrt(np.mean(frame ** 2))
+                        energies.append(energy)
+                        
+                        # Calculate zero-crossing rate
+                        zero_crossing = np.sum(np.abs(np.diff(np.signbit(frame)))) / (2 * len(frame))
+                        zero_crossings.append(zero_crossing)
+                        
+                        # Calculate spectral centroid for better speech/noise discrimination
+                        if len(frame) >= 512:  # Ensure enough samples for FFT
+                            spec = np.abs(np.fft.rfft(frame))
+                            freqs = np.fft.rfftfreq(len(frame), 1/sr)
+                            centroid = np.sum(freqs * spec) / (np.sum(spec) + 1e-8)
+                            spectral_centroids.append(centroid)
+                        else:
+                            spectral_centroids.append(0)
+                
+                if not energies:
+                    print("No valid audio frames processed")
+                    return [False]
+                
+                # Normalize features
+                energies = np.array(energies)
+                zero_crossings = np.array(zero_crossings)
+                spectral_centroids = np.array(spectral_centroids)
+                
+                # Dynamic thresholding using percentiles
+                energy_threshold = np.percentile(energies, 60)  # Slightly more sensitive
+                zcr_threshold = np.percentile(zero_crossings, 65)
+                centroid_threshold = np.percentile(spectral_centroids, 70)
+                
+                # Combine features for speaking detection with weights
+                speaking_frames_detailed = []
+                for e, z, c in zip(energies, zero_crossings, spectral_centroids):
+                    # Multi-feature speech detection with weighted scoring
+                    energy_score = (e > energy_threshold) * 0.5
+                    zcr_score = (z > zcr_threshold) * 0.3
+                    centroid_score = (c > centroid_threshold) * 0.2
+                    
+                    total_score = energy_score + zcr_score + centroid_score
+                    is_speaking = total_score > 0.4  # Threshold for combined features
+                    speaking_frames_detailed.append(is_speaking)
+                
+                # Interpolate back to video frame rate (due to overlap)
+                speaking_frames = []
+                step = 2  # Because of 50% overlap
+                for i in range(0, len(speaking_frames_detailed), step):
+                    # Take maximum value in window to favor positive detections
+                    window = speaking_frames_detailed[i:i + step]
+                    speaking_frames.append(any(window))
+                
+                # Apply enhanced temporal smoothing
+                window = 3  # Reduced window size for faster response
+                min_speech_duration = int(0.15 * self.fps)  # Minimum 150ms for speech segment
+                
+                # First smoothing pass - remove isolated detections
+                smoothed_frames = []
+                for i in range(len(speaking_frames)):
+                    start = max(0, i - window)
+                    end = min(len(speaking_frames), i + window + 1)
+                    window_frames = speaking_frames[start:end]
+                    # Use weighted average with center bias
+                    weights = np.hamming(end - start)
+                    is_speaking = np.sum(np.array(window_frames) * weights) > np.sum(weights) * 0.5
+                    smoothed_frames.append(is_speaking)
+                
+                # Second pass - enforce minimum duration
+                final_frames = []
+                current_segment = []
+                
+                for is_speaking in smoothed_frames:
+                    if is_speaking:
+                        current_segment.append(True)
+                    else:
+                        if len(current_segment) > 0:
+                            # If segment is too short, mark as not speaking
+                            if len(current_segment) < min_speech_duration:
+                                final_frames.extend([False] * len(current_segment))
+                            else:
+                                final_frames.extend(current_segment)
+                            current_segment = []
+                        final_frames.append(False)
+                
+                # Handle last segment
+                if current_segment:
+                    if len(current_segment) < min_speech_duration:
+                        final_frames.extend([False] * len(current_segment))
+                    else:
+                        final_frames.extend(current_segment)
+                
+                return final_frames
+                
+            except Exception as e:
+                print(f"Fatal error in audio analysis: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return [False]
+                
+        def is_speaking_at_frame(self, frame_idx: int) -> bool:
+            """Check if there is speaking activity at a given frame"""
+            if not self.speaking_frames or frame_idx >= len(self.speaking_frames):
+                return False
+            return self.speaking_frames[frame_idx]
 
-# Global set to track temporary files
-_temp_files_created = set()
+class SpeechAndFaceAnalyzer:
+    """Analyzes speech patterns and face positions to determine optimal camera movements"""
+    
+    def __init__(self):
+        self.MIN_SPEECH_DURATION = 0.5  # Minimum duration in seconds to consider switching focus
+        self.BRIEF_SPEECH_THRESHOLD = 1.0  # Duration threshold for brief speech
+        self.POSITION_CHANGE_THRESHOLD = 0.4  # Relative frame width threshold for position change
+    
+    def analyze_video(self, video_path: str, fps: int) -> Dict:
+        """Pre-analyze entire video for speech and face positions"""
+        cap = cv2.VideoCapture(video_path)
+        frame_width = int(cap.get(3))
+        total_frames = int(cap.get(7))
+        print(f"Analyzing video with {total_frames} frames...")
+        
+        # Initialize face detection
+        face_detector = mp.solutions.face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0.7
+        )
+        
+        # Detect speech for entire video first
+        try:
+            print("Starting audio analysis...")
+            speaker_detector = VideoProcessor.SpeakerDetector(video_path, fps)
+            speaking_frames = speaker_detector.get_speaking_frames()
+            if not speaking_frames:
+                print("Warning: No speaking frames detected, using motion-based detection...")
+                # Initialize motion-based detection as fallback
+                speaking_frames = [False] * total_frames
+            else:
+                print(f"Successfully detected {sum(speaking_frames)} speaking frames")
+        except Exception as e:
+            print(f"Error in speaker detection, using motion-based fallback: {str(e)}")
+            speaking_frames = [False] * total_frames
+        
+        # Analyze face positions throughout video
+        print("Starting face detection analysis...")
+        face_positions = []
+        face_count = 0
+        frame_idx = 0
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Detect faces
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_detector.process(rgb_frame)
+            
+            faces = []
+            if results.detections:
+                for detection in results.detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    h, w, _ = frame.shape
+                    x = int(bbox.xmin * w)
+                    y = int(bbox.ymin * h)
+                    width = int(bbox.width * w)
+                    height = int(bbox.height * h)
+                    score = detection.score[0]
+                    face_count += 1
+                    faces.append({
+                        'bbox': (x, y, width, height),
+                        'center': x + (width // 2),
+                        'size': width * height,
+                        'score': score
+                    })
+            
+            face_positions.append(faces)
+            frame_idx += 1
+            
+            # Print progress every 100 frames
+            if frame_idx % 100 == 0:
+                print(f"Processed {frame_idx}/{total_frames} frames, detected {face_count} faces so far...")
+        
+        cap.release()
+        print(f"Face detection complete. Total faces detected: {face_count}")
+        
+        # Analyze speech segments
+        print("Analyzing speech segments...")
+        speech_segments = self._find_speech_segments(speaking_frames, fps)
+        print(f"Found {len(speech_segments)} speech segments")
+        
+        # Determine optimal focus points and transitions
+        print("Calculating optimal camera movements...")
+        focus_points = self._calculate_focus_points(
+            speech_segments,
+            face_positions,
+            frame_width,
+            fps
+        )
+        print(f"Generated {len(focus_points)} focus points for camera movement")
+        
+        return {
+            'speech_segments': speech_segments,
+            'face_positions': face_positions,
+            'focus_points': focus_points,
+            'total_frames': total_frames,
+            'speaking_frames': speaking_frames
+        }
+    
+    def _find_speech_segments(self, speaking_frames: List[bool], fps: int) -> List[Dict]:
+        """Find continuous segments of speech"""
+        segments = []
+        current_segment = None
+        
+        for frame_idx, is_speaking in enumerate(speaking_frames):
+            frame_time = frame_idx / fps
+            
+            if is_speaking and current_segment is None:
+                # Start new segment
+                current_segment = {
+                    'start_frame': frame_idx,
+                    'start_time': frame_time,
+                    'end_frame': frame_idx,
+                    'end_time': frame_time
+                }
+            elif is_speaking and current_segment is not None:
+                # Extend current segment
+                current_segment['end_frame'] = frame_idx
+                current_segment['end_time'] = frame_time
+            elif not is_speaking and current_segment is not None:
+                # End current segment
+                current_segment['duration'] = (
+                    current_segment['end_time'] - current_segment['start_time']
+                )
+                segments.append(current_segment)
+                current_segment = None
+        
+        # Handle last segment if it exists
+        if current_segment is not None:
+            current_segment['duration'] = (
+                current_segment['end_time'] - current_segment['start_time']
+            )
+            segments.append(current_segment)
+        
+        return segments
+    
+    def _calculate_focus_points(
+        self,
+        speech_segments: List[Dict],
+        face_positions: List[List[Dict]],
+        frame_width: int,
+        fps: int
+    ) -> List[Dict]:
+        """Calculate optimal focus points and transitions"""
+        focus_points = []
+        last_major_speaker_pos = None
+        last_focus_point = None
+        self.MIN_SPEECH_DURATION = 0.3  # Reduced from 0.5 to be more responsive
+        self.BRIEF_SPEECH_THRESHOLD = 0.8  # Reduced from 1.0 to catch more speaking segments
+        self.POSITION_CHANGE_THRESHOLD = 0.25  # Reduced from 0.4 to be more sensitive to movement
+
+        # Initialize with a center focus point if we have any face data
+        initial_focus = {
+            'start_frame': 0,
+            'target_position': frame_width // 2,
+            'transition': 'smooth',
+            'is_major_speaker': False
+        }
+        focus_points.append(initial_focus)
+        last_focus_point = initial_focus  # Set initial focus point
+        
+        for segment in speech_segments:
+            # Find the most prominent speaking face during this segment
+            avg_face_pos = self._find_prominent_face_in_segment(
+                segment,
+                face_positions,
+                frame_width
+            )
+            
+            if avg_face_pos is None:
+                continue
+            
+            # Determine if this is a brief interjection
+            is_brief = segment['duration'] < self.BRIEF_SPEECH_THRESHOLD
+            
+            # Determine if position change is significant
+            significant_change = True
+            if last_major_speaker_pos is not None:
+                rel_pos_change = abs(avg_face_pos - last_major_speaker_pos) / frame_width
+                significant_change = rel_pos_change > self.POSITION_CHANGE_THRESHOLD
+            
+            # Decision logic for creating new focus points
+            create_new_point = (
+                significant_change or
+                (not is_brief and segment['duration'] > self.MIN_SPEECH_DURATION)
+            )
+            
+            if create_new_point:
+                # Determine transition type based on position change
+                transition_type = 'smooth'  # Default to smooth transition
+                if significant_change and last_focus_point is not None:
+                    # Only check for hard cuts if we have a previous focus point
+                    pos_change = abs(avg_face_pos - last_focus_point['target_position']) / frame_width
+                    if pos_change > 0.4:
+                        transition_type = 'cut'  # Use hard cut for large position changes
+                
+                focus_point = {
+                    'start_frame': segment['start_frame'],
+                    'target_position': avg_face_pos,
+                    'transition': transition_type,
+                    'is_major_speaker': not is_brief,
+                    'duration': segment['duration']  # Add duration for debugging
+                }
+                
+                # Add intermediate focus point for long segments to maintain interest
+                if segment['duration'] > 2.0 and len(faces_in_segment := self._get_faces_in_frame_range(
+                    segment['start_frame'], 
+                    segment['end_frame'],
+                    face_positions
+                )) > 1:
+                    mid_frame = (segment['start_frame'] + segment['end_frame']) // 2
+                    mid_pos = self._find_alternate_face_position(
+                        avg_face_pos,
+                        faces_in_segment,
+                        frame_width
+                    )
+                    if mid_pos is not None and abs(mid_pos - avg_face_pos) / frame_width > 0.2:
+                        focus_points.append({
+                            'start_frame': mid_frame,
+                            'target_position': mid_pos,
+                            'transition': 'smooth',
+                            'is_major_speaker': False,
+                            'duration': 1.0  # Short duration for variety
+                        })
+                
+                focus_points.append(focus_point)
+                last_focus_point = focus_point
+                
+                if not is_brief:
+                    last_major_speaker_pos = avg_face_pos
+        
+        return focus_points
+
+    def _get_faces_in_frame_range(
+        self,
+        start_frame: int,
+        end_frame: int,
+        face_positions: List[List[Dict]]
+    ) -> List[Dict]:
+        """Get unique faces in a frame range"""
+        unique_positions = set()
+        faces = []
+        for frame_idx in range(start_frame, end_frame + 1):
+            if frame_idx >= len(face_positions):
+                break
+            for face in face_positions[frame_idx]:
+                pos = face['center']
+                if pos not in unique_positions:
+                    unique_positions.add(pos)
+                    faces.append(face)
+        return faces
+        
+    def _find_alternate_face_position(
+        self,
+        current_pos: int,
+        faces: List[Dict],
+        frame_width: int
+    ) -> Optional[int]:
+        """Find an alternative face position for variety in long segments"""
+        if not faces:
+            return None
+            
+        # Filter faces that are far enough from current position
+        alternate_faces = [
+            face for face in faces
+            if abs(face['center'] - current_pos) / frame_width > 0.2
+        ]
+        
+        if not alternate_faces:
+            return None
+            
+        # Choose the face with the highest score
+        best_alt_face = max(alternate_faces, key=lambda x: x['score'])
+        return best_alt_face['center']
+
+    def _find_prominent_face_in_segment(
+        self,
+        segment: Dict,
+        face_positions: List[List[Dict]],
+        frame_width: int
+    ) -> Optional[int]:
+        """Find the most prominent face position during a speech segment"""
+        if not face_positions:
+            return None
+            
+        # Get all faces in the segment timeframe
+        start_frame = segment['start_frame']
+        end_frame = segment['end_frame']
+        
+        # Collect face data for the segment
+        face_data = []
+        for frame_idx in range(start_frame, end_frame + 1):
+            if frame_idx >= len(face_positions):
+                break
+            for face in face_positions[frame_idx]:
+                face_data.append({
+                    'center': face['center'],
+                    'size': face['size'],
+                    'score': face['score']
+                })
+        
+        if not face_data:
+            return None
+            
+        # Group faces by similar positions (within 5% of frame width)
+        position_groups = {}
+        tolerance = frame_width * 0.05
+        
+        for face in face_data:
+            center = face['center']
+            matched = False
+            
+            for group_center in list(position_groups.keys()):
+                if abs(center - group_center) < tolerance:
+                    position_groups[group_center]['count'] += 1
+                    position_groups[group_center]['total_score'] += face['score']
+                    position_groups[group_center]['total_size'] += face['size']
+                    position_groups[group_center]['centers'].append(center)
+                    matched = True
+                    break
+            
+            if not matched:
+                position_groups[center] = {
+                    'count': 1,
+                    'total_score': face['score'],
+                    'total_size': face['size'],
+                    'centers': [center]
+                }
+        
+        # Find the most prominent group
+        best_group = None
+        best_score = -1
+        
+        for center, data in position_groups.items():
+            # Calculate weighted score based on frequency, detection confidence, and face size
+            frequency_weight = data['count'] / len(face_data)
+            avg_score = data['total_score'] / data['count']
+            avg_size = data['total_size'] / data['count']
+            
+            # Normalize size score relative to frame width
+            size_score = avg_size / (frame_width * frame_width)
+            
+            # Combined score with weights
+            combined_score = (
+                frequency_weight * 0.5 +  # 50% weight on frequency
+                avg_score * 0.3 +        # 30% weight on detection confidence
+                size_score * 0.2         # 20% weight on face size
+            )
+            
+            if combined_score > best_score:
+                best_score = combined_score
+                best_group = data
+        
+        if best_group is None:
+            return None
+            
+        # Return the median position of the best group
+        return int(np.median(best_group['centers']))
+        
+# Create a singleton instance
+video_processor = VideoProcessor()
+
+def detect_face_and_crop(video_path: str, start: float, end: float) -> str:
+    """Wrapper function for the video processor"""
+    return video_processor.detect_face_and_crop(video_path, start, end)

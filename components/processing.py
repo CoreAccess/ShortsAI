@@ -1,11 +1,11 @@
 import os
 import shutil
-from components.edits import extractAudio, detect_face_and_crop
-from components.helpers import get_file_hash
+from components.helpers import get_file_hash, extractAudio
 from components.sentiment_analysis import analyze_emotions
 from components.subtitles import write_ass, burn_subtitles
 from components.transcriptions import transcribe_audio
 from components.conversations import conversation_detection
+from components.edits import detect_face_and_crop
 import json
 
 def process_video(video_path, progress_dict, temp_dir, finished_dir):
@@ -105,7 +105,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         print(f"Updated transcript with {len(interesting_segments)} potential conversation segments")
 
         # Clamp this to 2 for now, remove it later on
-        interesting_segments = interesting_segments[:1] 
+        interesting_segments = interesting_segments[:1]  
 
         # Process each interesting segment
         for idx, segment in enumerate(interesting_segments, 1):
@@ -114,18 +114,17 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
 
             progress_dict[filename] = {"progress": 65, "error": False}
 
-            cropped_file = os.path.join(temp_dir, f"{file_hash}_dramatic_clip_{start_time:.2f}_{end_time:.2f}.mp4")
-            subtitled_file = os.path.join(temp_dir, f"{file_hash}_dramatic_clip_with_subtitles_{start_time:.2f}_{end_time:.2f}.mp4")
-
-            if not os.path.exists(cropped_file):
-                try:
-                    detect_face_and_crop(temp_file_path, cropped_file, start_time, end_time)
+            try:
+                # Call detect_face_and_crop with just video_path, start_time, and end_time
+                cropped_file = detect_face_and_crop(temp_file_path, start_time, end_time)
+                if cropped_file:
                     print(f"Clip Was Extracted To: {cropped_file}")
-                except ValueError as e:
-                    print(f"No faces detected in the video segment: {str(e)}")
+                else:
+                    print("Failed to extract clip")
                     continue
-            else:
-                print(f"Clip Already Exists Using: {cropped_file}")
+            except ValueError as e:
+                print(f"No faces detected in the video segment: {str(e)}")
+                continue
 
             # Debugging statement to check if the cropped file exists
             if os.path.exists(cropped_file):
@@ -180,6 +179,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
                 print("Starting Subtitle Generation...")
                 write_ass(subtitles, ass_file, cropped_file)
 
+                subtitled_file = os.path.join(temp_dir, f"{file_hash}_dramatic_clip_with_subtitles_{start_time:.2f}_{end_time:.2f}.mp4")
                 if not os.path.exists(subtitled_file):
                     burn_subtitles(cropped_file, ass_file, subtitled_file)
                     print(f"Generated Clip With Subtitles At: {subtitled_file}")
@@ -224,6 +224,7 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
         import traceback
         traceback.print_exc()
     finally:
+        '''
         # Only clean up temp files after all segments are processed
         if progress_dict[filename]["progress"] == 100:
             print("Processing complete, cleaning up temporary files...")
@@ -237,3 +238,4 @@ def process_video(video_path, progress_dict, temp_dir, finished_dir):
                 except Exception as e:
                     print(f"Error deleting file: {file_path}")
                     print(e)
+        '''

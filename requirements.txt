@@ -10,3 +10,6 @@ psutil
 mediapipe
 pydub
 webrtcvad
+moviepy==2.0.0.dev2
+librosa
+soundfile

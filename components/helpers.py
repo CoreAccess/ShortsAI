@@ -1,6 +1,9 @@
 import hashlib
 import json
 import subprocess
+import librosa
+import soundfile as sf
+from moviepy.editor import VideoFileClip
 
 # ----------------------------------------------------------------------------
 # Return the duration of a video using ffprobe.
@@ -195,3 +198,30 @@ def find_sentence_end(transcription_segments, start_index):
 # Add a helper function at the top (after the imports)
 def normalize_path(path):
     return path.replace('\\', '/')
+
+def extractAudio(video_path: str, output_path: str) -> str:
+    """Extract audio from a video file using librosa."""
+    try:
+        # First try using librosa for better audio handling
+        try:
+            y, sr = librosa.load(video_path, sr=None)
+            sf.write(output_path, y, sr)
+            return output_path
+        except Exception as e:
+            print(f"Librosa extraction failed, falling back to MoviePy: {str(e)}")
+            
+            # Fallback to MoviePy if librosa fails
+            with VideoFileClip(video_path) as video:
+                audio = video.audio
+                if audio is None:
+                    print("No audio stream found in the video")
+                    return None
+                try:
+                    audio.write_audiofile(output_path)
+                    return output_path
+                except Exception as e:
+                    print(f"MoviePy audio extraction failed: {str(e)}")
+                    return None
+    except Exception as e:
+        print(f"Error extracting audio: {str(e)}")
+        return None
