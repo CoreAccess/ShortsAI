@@ -12,6 +12,7 @@ from typing import Tuple, List, Dict, Optional
 from collections import deque
 from contextlib import contextmanager
 from scipy import ndimage, signal
+import math  # Added math import
 
 def create_face_dict(bbox: Tuple[int, int, int, int], score: float = 1.0, face_id: int = -1) -> Dict:
     """Helper function to create a consistently structured face dictionary"""
@@ -251,6 +252,16 @@ class SpeechAndFaceAnalyzer:
             min_detection_confidence=0.5  # Lowered from 0.7 for better detection
         )
         
+        # Initialize analysis dictionary with all required fields
+        analysis = {
+            'speaking_frames': [],
+            'face_positions': [],
+            'speech_segments': [],
+            'focus_points': [],
+            'total_frames': total_frames,
+            'frame_width': frame_width
+        }
+        
         # Detect speech for entire video first
         try:
             print("\nStarting audio analysis...")
@@ -258,22 +269,21 @@ class SpeechAndFaceAnalyzer:
             speaking_frames = speaker_detector.get_speaking_frames()
             if not speaking_frames:
                 print("Warning: No speaking frames detected!")
-                speaking_frames = [False] * total_frames
+                speaking_frames = [0.0] * total_frames
             else:
                 speaking_count = sum(1 for score in speaking_frames if score > 0.4)
                 print(f"Successfully detected {speaking_count} speaking frames out of {len(speaking_frames)}")
-                print(f"Sample of speech scores: {speaking_frames[:10]}")
+            analysis['speaking_frames'] = speaking_frames
         except Exception as e:
             print(f"Error in speaker detection: {str(e)}")
-            import traceback
             traceback.print_exc()
-            speaking_frames = [False] * total_frames
+            analysis['speaking_frames'] = [0.0] * total_frames
         
         # Analyze face positions throughout video
         print("Starting face detection analysis...")
-        face_positions = []
         face_count = 0
         frame_idx = 0
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -295,7 +305,7 @@ class SpeechAndFaceAnalyzer:
                     faces.append(create_face_dict(bbox=(x, y, width, height), score=float(detection.score[0])))
                     face_count += 1
             
-            face_positions.append(faces)
+            analysis['face_positions'].append(faces)
             frame_idx += 1
             
             if frame_idx % 100 == 0:
@@ -303,33 +313,28 @@ class SpeechAndFaceAnalyzer:
         
         cap.release()
         print(f"Face detection complete. Total faces detected: {face_count}")
+        print(f"Total frames analyzed: {len(analysis['face_positions'])}")
         
         # Track faces to maintain consistent IDs
         print("Tracking faces across frames...")
-        face_positions = self._track_faces(face_positions, frame_width)
+        analysis['face_positions'] = self._track_faces(analysis['face_positions'], frame_width)
         
         # Analyze speech segments
         print("Analyzing speech segments...")
-        speech_segments = self._find_speech_segments(speaking_frames, fps)
-        print(f"Found {len(speech_segments)} speech segments")
+        analysis['speech_segments'] = self._find_speech_segments(analysis['speaking_frames'], fps)
+        print(f"Found {len(analysis['speech_segments'])} speech segments")
         
         # Determine optimal focus points and transitions
         print("Calculating optimal camera movements...")
-        focus_points = self._calculate_focus_points(
-            speech_segments,
-            face_positions,
+        analysis['focus_points'] = self._calculate_focus_points(
+            analysis['speech_segments'],
+            analysis['face_positions'],
             frame_width,
             fps
         )
-        print(f"Generated {len(focus_points)} focus points for camera movement")
+        print(f"Generated {len(analysis['focus_points'])} focus points for camera movement")
         
-        return {
-            'speech_segments': speech_segments,
-            'face_positions': face_positions,
-            'focus_points': focus_points,
-            'total_frames': total_frames,
-            'speaking_frames': speaking_frames
-        }
+        return analysis
     
     def _find_speech_segments(self, speaking_frames: List[bool], fps: int) -> List[Dict]:
         """Find continuous segments of speech"""
@@ -1267,7 +1272,7 @@ class VideoProcessor:
             return None
             
     def _process_video_with_analysis(self, video_path: str, analysis: Dict) -> List[Dict]:
-        """Process video frames using pre-analysis data with aggressive face tracking"""
+        """Process video frames using pre-analysis data with improved face tracking"""
         processed_frames = []
         
         cap = cv2.VideoCapture(video_path)
@@ -1280,195 +1285,193 @@ class VideoProcessor:
         if target_width % 2 != 0:
             target_width += 1.0
         
-        # Initialize with centered position
-        current_position = float((frame_width - target_width) / 2)
-        target_position = current_position
+        # Analyze initial frames to find starting position
+        initial_analysis = self._analyze_initial_frames(video_path, analysis)
+        current_position = float((frame_width - target_width) / 2)  # Default center
+        if initial_analysis:
+            initial_pos = initial_analysis['initial_position'] - (target_width / 2)
+            current_position = np.clip(initial_pos, 0, frame_width - target_width)
         
         # Tracking state
-        current_tracked_face = None
-        stable_position_count = 0
-        STABILITY_THRESHOLD = 8  # Increased frames needed for stability
-        MOVEMENT_THRESHOLD = target_width * 0.03  # Reduced to 3% for less jitter
-        LOCK_THRESHOLD = 15  # Frames needed to lock position
-        TRANSITION_FRAMES = 10  # Frames to smooth transition between locked positions
-        VELOCITY_DAMPING = 0.85  # Damping factor for velocity
-        last_significant_move = 0
-        position_locked = False
-        locked_position = None
-        transition_start_pos = None
-        transition_end_pos = None
-        transition_frame_count = 0
-        velocity = 0.0  # Current velocity for smooth movement
+        current_speaker = None
+        speaking_duration = 0
+        last_transition = 0
+        STABILITY_THRESHOLD = 5  # Base stability threshold for single face
+        MULTI_FACE_STABILITY_THRESHOLD = 45  # Extended threshold for multiple faces (~1.5 seconds at 30fps)
+        FALLBACK_STABILITY_THRESHOLD = 60  # Even longer stability for fallback cases
+        TRANSITION_FRAMES = 8
+        remaining_transition = 0
+        transition_start = current_position
+        transition_target = current_position
+        transition_type = 'none'
+        last_multi_face_switch = 0  # Track last switch during multi-face scenario
+        min_speaking_frames_for_switch = int(fps * 0.5)  # Require at least 0.5 seconds of speaking
         
+        # Add state for fallback tracking
+        current_fallback_face = None
+        fallback_duration = 0
+        MIN_FALLBACK_DURATION = int(fps * 2)  # Stay with fallback for at least 2 seconds
+        
+        # Multi-face specific tracking state
+        last_speaker_switch = 0
+        consistent_speaker_duration = 0
+        last_stable_position = None
+        speech_confidence_history = deque(maxlen=int(fps * 2))  # 2 seconds of history
+
         frame_idx = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            faces = self._detect_faces(frame)
+            is_speaking = analysis['speaking_frames'][frame_idx] > 0.4 if frame_idx < len(analysis['speaking_frames']) else False
+            
+            # Enhanced window analysis for multi-face scenarios
+            window_analysis = self._analyze_frame_window(frame_idx, faces, analysis, 
+                                                       look_ahead=45 if len(faces) > 1 else 30,  # Longer lookahead for multi-face
+                                                       look_back=30 if len(faces) > 1 else 15)   # Longer history for multi-face
+            best_track = window_analysis['best_track']
+
+            # Multi-face specific logic
+            if len(faces) > 1:
+                # Calculate speech confidence and maintain history
+                if best_track:
+                    speech_conf = min(1.0, (best_track['speaking_duration'] * 0.3 + 
+                                          best_track['future_speaking'] * 0.4 +
+                                          best_track['consistency_score'] * 0.3))
+                    speech_confidence_history.append(speech_conf)
                 
-            # Get faces and speech info
-            faces = self._detect_faces(frame) 
-            
-            # Get speaking state
-            is_speaking = False
-            if frame_idx < len(analysis['speaking_frames']):
-                is_speaking = analysis['speaking_frames'][frame_idx] > 0.4
-            
-            # First priority: Find speaking faces
-            speaking_faces = []
-            non_speaking_faces = []
-            
-            for face in faces:
-                if is_speaking:
-                    speaking_faces.append(face)
-                else:
-                    non_speaking_faces.append(face)
-            
-            # Target selection with stability
-            new_target = None
-            
-            if speaking_faces:
-                # Find the most central speaking face
-                best_speaking_face = min(speaking_faces, 
-                                       key=lambda f: abs(f['center'] - frame_width/2))
-                
-                if current_tracked_face is None:
-                    # No current track, start tracking this face
-                    new_target = best_speaking_face['center']
-                    current_tracked_face = best_speaking_face
-                    stable_position_count = 0
-                else:
-                    # Check if we should switch to the new speaking face
-                    current_center = current_tracked_face['center']
-                    new_center = best_speaking_face['center']
-                    distance = abs(new_center - current_center)
-                    
-                    # Only switch if the new face is significantly different
-                    if distance > target_width * 0.3:  # 30% of target width
-                        new_target = new_center
-                        current_tracked_face = best_speaking_face
-                        stable_position_count = 0
-                        last_significant_move = frame_idx
+                # Determine if we should maintain current position
+                if len(speech_confidence_history) > 0:
+                    avg_confidence = sum(speech_confidence_history) / len(speech_confidence_history)
+                    if avg_confidence > 0.7:  # High confidence threshold
+                        consistent_speaker_duration += 1
                     else:
-                        # Keep tracking current face with stability
-                        new_target = current_center
-                        stable_position_count += 1
-            
-            elif non_speaking_faces:
-                if current_tracked_face is None:
-                    # No current track, find most central face
-                    best_face = min(non_speaking_faces, 
-                                  key=lambda f: abs(f['center'] - frame_width/2))
-                    new_target = best_face['center']
-                    current_tracked_face = best_face
-                    stable_position_count = 0
-                else:
-                    # Try to find current tracked face
-                    found = False
-                    for face in non_speaking_faces:
-                        if abs(face['center'] - current_tracked_face['center']) < target_width * 0.2:
-                            current_tracked_face = face
-                            new_target = face['center']
-                            found = True
-                            stable_position_count += 1
-                            break
-                    
-                    if not found:
-                        # Only switch if we've been stable for a while
-                        if frame_idx - last_significant_move > fps * 1.0:  # 1 second
-                            best_face = min(non_speaking_faces, 
-                                          key=lambda f: abs(f['center'] - frame_width/2))
-                            new_target = best_face['center']
-                            current_tracked_face = best_face
-                            stable_position_count = 0
-                            last_significant_move = frame_idx
-            
-            # Position update with velocity dampening
-            if new_target is not None:
-                target_center = new_target - (target_width / 2)
-                
-                if transition_frame_count > 0:
-                    # Smooth transition with velocity dampening
-                    progress = transition_frame_count / TRANSITION_FRAMES
-                    target_pos = transition_start_pos + (transition_end_pos - transition_start_pos) * (1 - progress)
-                    velocity = (target_pos - current_position) * 0.2
-                    velocity *= VELOCITY_DAMPING
-                    current_position += velocity
-                    transition_frame_count -= 1
-                    if transition_frame_count == 0:
-                        position_locked = True
-                        locked_position = transition_end_pos
-                        velocity = 0.0
-                elif position_locked:
-                    if abs(target_center - locked_position) > target_width * 0.3:
-                        # Start transition with reset velocity
-                        transition_start_pos = locked_position
-                        transition_end_pos = target_center
-                        transition_frame_count = TRANSITION_FRAMES
-                        position_locked = False
-                        stable_position_count = 0
-                        velocity = 0.0
-                    else:
-                        # Stay perfectly still when locked
-                        current_position = locked_position
-                        velocity = 0.0
-                else:
-                    if stable_position_count >= STABILITY_THRESHOLD:
-                        if abs(target_center - current_position) <= MOVEMENT_THRESHOLD:
-                            stable_position_count += 1
-                            if stable_position_count >= LOCK_THRESHOLD:
-                                position_locked = True
-                                locked_position = current_position
-                                velocity = 0.0
+                        consistent_speaker_duration = max(0, consistent_speaker_duration - 1)
+
+                # Enhanced stability checks for multi-face scenarios
+                if best_track and current_speaker:
+                    same_speaker = (abs(best_track['face']['center'] - current_speaker['center']) < target_width * 0.1)
+                    if same_speaker:
+                        consistent_speaker_duration += 1
+                    elif consistent_speaker_duration > int(fps * 1.5):  # Require longer stable duration
+                        # Only switch if new speaker is significantly more confident
+                        if (best_track['total_score'] > 
+                            window_analysis['tracks'][1]['total_score'] * 1.3):  # 30% better
+                            consistent_speaker_duration = 0
+                            last_speaker_switch = frame_idx
                         else:
-                            # Very gentle movement when near stable
-                            velocity = (target_center - current_position) * 0.05
-                            velocity *= VELOCITY_DAMPING
-                            current_position += velocity
-                    else:
-                        current_distance = abs(target_center - current_position)
-                        if current_distance > target_width * 0.1:
-                            if current_tracked_face and current_tracked_face.get('score', 0) > 0.8:
-                                # Smooth transition for high confidence faces
-                                transition_start_pos = current_position
-                                transition_end_pos = target_center
-                                transition_frame_count = TRANSITION_FRAMES
-                                velocity = 0.0
-                            else:
-                                # Direct jump with velocity reset
-                                current_position = target_center
-                                velocity = 0.0
-                            stable_position_count = 0
-                        else:
-                            # Normal movement with velocity dampening
-                            velocity = (target_center - current_position) * 0.2
-                            velocity *= VELOCITY_DAMPING
-                            current_position += velocity
-                
-                # Ensure bounds with velocity reset at boundaries
-                old_position = current_position
-                current_position = float(np.clip(current_position, 0, frame_width - target_width))
-                if current_position != old_position:
-                    velocity = 0.0  # Reset velocity if we hit boundaries
+                            best_track = None  # Maintain current speaker
             
-            # Ensure even position for display
+            # Determine if we should use the fallback face
+            use_fallback = False
+            if not best_track or (window_analysis['has_competing_speaker'] and 
+                                best_track['consistency_score'] < 0.6):
+                use_fallback = True
+                
+                if window_analysis['fallback_face']:
+                    if not current_fallback_face:
+                        current_fallback_face = window_analysis['fallback_face']
+                        fallback_duration = 0
+                    else:
+                        # Only update fallback if position is close to maintain stability
+                        new_center = window_analysis['fallback_face']['center']
+                        curr_center = current_fallback_face['center']
+                        if abs(new_center - curr_center) < target_width * 0.1:
+                            current_fallback_face = window_analysis['fallback_face']
+                            fallback_duration += 1
+
+            # Choose the active face with enhanced multi-face consideration
+            new_speaker = None
+            if use_fallback and current_fallback_face:
+                if fallback_duration >= MIN_FALLBACK_DURATION:
+                    new_speaker = current_fallback_face
+                    speaking_duration = fallback_duration
+                elif current_speaker:
+                    new_speaker = current_speaker  # Maintain current speaker during fallback transition
+                    speaking_duration += 1
+            elif best_track:
+                if len(faces) > 1:
+                    # Additional checks for multi-face stability
+                    if frame_idx - last_speaker_switch < int(fps * 2):  # 2 second minimum between switches
+                        new_speaker = current_speaker if current_speaker else best_track['face']
+                    elif consistent_speaker_duration > int(fps * 1.5):  # Require longer consistency
+                        new_speaker = best_track['face']
+                    else:
+                        new_speaker = current_speaker if current_speaker else best_track['face']
+                else:
+                    new_speaker = best_track['face']
+                speaking_duration = best_track['speaking_duration']
+                current_fallback_face = None
+                fallback_duration = 0
+
+            # Update position with enhanced stability for multi-face
+            if new_speaker:
+                target_center = new_speaker['center']
+                target_pos = target_center - (target_width / 2)
+                target_pos = np.clip(target_pos, 0, frame_width - target_width)
+                
+                in_frame = (target_center >= current_position + target_width * 0.15 and  
+                          target_center <= current_position + target_width * 0.85)
+
+                should_move, move_type = self._should_transition_to_face(
+                    current_position, target_pos, len(faces), in_frame, target_width
+                )
+                
+                current_stability_threshold = (
+                    MULTI_FACE_STABILITY_THRESHOLD if len(faces) > 1 
+                    else STABILITY_THRESHOLD
+                )
+                
+                # Enhanced multi-face movement constraints
+                if len(faces) > 1:
+                    # Require stronger confidence for movement
+                    if consistent_speaker_duration < int(fps * 1.5):  # Require 1.5 seconds of consistency
+                        should_move = False
+                    elif frame_idx - last_multi_face_switch < int(fps * 2):  # Minimum 2 seconds between switches
+                        should_move = False
+                    elif should_move:
+                        # Store last stable position for potential reversion
+                        last_stable_position = current_position
+                        last_multi_face_switch = frame_idx
+                
+                if should_move and frame_idx - last_transition > current_stability_threshold:
+                    transition_start = current_position
+                    transition_target = target_pos
+                    transition_type = move_type
+                    remaining_transition = TRANSITION_FRAMES * (2 if len(faces) > 1 else 1)  # Slower transitions for multi-face
+                    last_transition = frame_idx
+
+            # Update position if in transition
+            if remaining_transition > 0:
+                # Use more gradual easing for multi-face scenarios
+                if len(faces) > 1:
+                    progress = 0.5 * (1 - math.cos(math.pi * (TRANSITION_FRAMES - remaining_transition) / TRANSITION_FRAMES))
+                else:
+                    progress = (TRANSITION_FRAMES - remaining_transition) / TRANSITION_FRAMES
+                current_position = transition_start + (transition_target - transition_start) * progress
+                remaining_transition -= 1
+            
+            # Ensure even position
             display_position = int(current_position)
             if display_position % 2 != 0:
                 display_position -= 1
             
-            # Store frame data with lock status
+            # Update current speaker
+            current_speaker = new_speaker
+            
             processed_frames.append({
                 'frame_idx': frame_idx,
                 'faces': faces,
                 'is_speaking': is_speaking,
-                'audio_measure': analysis['speaking_frames'][frame_idx] if frame_idx < len(analysis['speaking_frames']) else 0.0,
                 'crop_x': display_position,
                 'frame_width': frame_width,
                 'frame_height': frame_height,
                 'target_width': target_width,
-                'speaker_confidence': current_tracked_face['score'] if current_tracked_face else 0.0,
-                'speaker_duration': stable_position_count,
-                'position_locked': position_locked
+                'speaker_confidence': current_speaker['score'] if current_speaker else 0.0,
+                'speaker_duration': speaking_duration,
+                'transition_type': transition_type
             })
             
             frame_idx += 1
@@ -1476,43 +1479,447 @@ class VideoProcessor:
         cap.release()
         return processed_frames
 
-    def _get_face_color(self, face_id: int) -> Tuple[int, int, int]:
-        """Generate a consistent color for a face ID using a hash function"""
-        import hashlib
-        # Use face_id to generate a consistent color
-        hash_val = int(hashlib.md5(str(face_id).encode()).hexdigest()[:6], 16)
-        r = (hash_val & 0xFF0000) >> 16
-        g = (hash_val & 0x00FF00) >> 8
-        b = hash_val & 0x0000FF
-        return (b, g, r)  # OpenCV uses BGR
+    def _analyze_initial_frames(self, video_path: str, analysis: Dict, frame_count: int = 30) -> Dict:
+        """Analyze initial frames to identify the first speaker's position"""
+        cap = cv2.VideoCapture(video_path)
+        faces_in_frames = []
+        speaking_scores = []
+        
+        for i in range(frame_count):
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            faces = self._detect_faces(frame)
+            speaking_score = analysis['speaking_frames'][i] if i < len(analysis['speaking_frames']) else 0.0
+            
+            faces_in_frames.append(faces)
+            speaking_scores.append(speaking_score)
+        
+        cap.release()
+        
+        # Find the most consistent speaking face
+        face_tracks = {}  # track_id -> list of positions
+        next_track_id = 0
+        
+        for frame_idx, faces in enumerate(faces_in_frames):
+            for face in faces:
+                matched = False
+                for track_id, track in face_tracks.items():
+                    if abs(track['last_pos'] - face['center']) < track['width'] * 0.5:
+                        track['frames'].append(frame_idx)
+                        track['positions'].append(face['center'])
+                        track['last_pos'] = face['center']
+                        track['speaking_score'] += speaking_scores[frame_idx]
+                        matched = True
+                        break
+                
+                if not matched:
+                    face_tracks[next_track_id] = {
+                        'frames': [frame_idx],
+                        'positions': [face['center']],
+                        'last_pos': face['center'],
+                        'width': face['bbox'][2],
+                        'speaking_score': speaking_scores[frame_idx],
+                        'consistency': 1.0
+                    }
+                    next_track_id += 1
+        
+        # Find the most suitable initial face with enhanced multi-face handling
+        best_track = None
+        best_score = 0
+        
+        for track_id, track in face_tracks.items():
+            duration = len(track['frames'])
+            avg_position = sum(track['positions']) / len(track['positions'])
+            
+            # Calculate position stability
+            if len(track['positions']) > 1:
+                pos_std = np.std(track['positions'])
+                position_stability = 1.0 / (1.0 + pos_std)
+            else:
+                position_stability = 0.5
+            
+            # Calculate centrality (prefer more central faces for initial position)
+            frame_width = analysis.get('frame_width', 1920)
+            centrality = 1.0 - abs(avg_position - frame_width/2) / (frame_width/2)
+            
+            # Enhanced scoring for initial position
+            score = (
+                duration * 0.4 +                # Duration weight
+                track['speaking_score'] * 0.3 + # Speaking weight
+                position_stability * 0.2 +      # Stability weight
+                centrality * 0.1                # Centrality weight
+            )
+            
+            # Bonus for faces that appear in early frames
+            if track['frames'][0] < frame_count * 0.3:
+                score *= 1.2
+            
+            if score > best_score:
+                best_score = score
+                best_track = track
+        
+        if best_track:
+            confidence = best_score
+            # If multiple faces are present, reduce confidence unless score is very high
+            if len(face_tracks) > 1 and best_score < 0.8:
+                confidence *= 0.8
+            
+            return {
+                'initial_position': sum(best_track['positions']) / len(best_track['positions']),
+                'confidence': confidence
+            }
+        
+        # Fallback to center position with low confidence
+        return {
+            'initial_position': analysis.get('frame_width', 1920) / 2,
+            'confidence': 0.1
+        }
 
-    def _find_prominent_face_in_segment(
-        self,
-        segment: Dict,
-        face_positions: List[List[Dict]],
-        frame_width: int
-    ) -> Optional[Dict]:
-        """Delegates to SpeechAndFaceAnalyzer's implementation"""
-        return self.analyzer._find_prominent_face_in_segment(segment, face_positions, frame_width)
+    def _track_faces(self, face_positions: List[List[Dict]], frame_width: int) -> List[List[Dict]]:
+        """Track and maintain consistent face IDs across frames with improved multi-face handling"""
+        tracked_faces = []
+        face_history = []  # Track face positions over time
+        next_face_id = 0
+        position_tolerance = frame_width * 0.1  # 10% of frame width
         
-    def _validate_face_consistency(
-        self,
-        segment: Dict,
-        face_positions: List[List[Dict]],
-        face_pos: Dict,
-        frame_width: int
-    ) -> bool:
-        """Delegates to SpeechAndFaceAnalyzer's implementation"""
-        return self.analyzer._validate_face_consistency(segment, face_positions, face_pos, frame_width)
+        # Enhanced track management
+        active_tracks = {}  # id -> track data
         
-    def _find_alternate_face_position(
-        self,
-        current_pos: int,
-        faces: List[Dict],
-        frame_width: int
-    ) -> Optional[Dict]:
-        """Delegates to SpeechAndFaceAnalyzer's implementation"""
-        return self.analyzer._find_alternate_face_position(current_pos, faces, frame_width)
+        for frame_faces in face_positions:
+            current_tracked = []
+            matched_ids = set()
+            
+            # Sort faces by size (larger faces first) to improve matching
+            frame_faces.sort(key=lambda x: x['size'], reverse=True)
+            
+            # First pass: try to match with recent tracks
+            for face in frame_faces:
+                face_center = face['center']
+                best_match_id = None
+                best_match_dist = position_tolerance
+                
+                # Look through active tracks from most recent to oldest
+                for track_id, track_data in active_tracks.items():
+                    if track_id in matched_ids:
+                        continue
+                        
+                    last_pos = track_data['last_position']
+                    dist = abs(face_center - last_pos)
+                    
+                    if dist < best_match_dist:
+                        best_match_dist = dist
+                        best_match_id = track_id
+                
+                if best_match_id is not None:
+                    # Update track
+                    track = active_tracks[best_match_id]
+                    track['last_position'] = face_center
+                    track['frames_visible'] += 1
+                    track['frames_since_seen'] = 0
+                    
+                    face['id'] = best_match_id
+                    current_tracked.append(face)
+                    matched_ids.add(best_match_id)
+                else:
+                    # Create new track
+                    new_id = next_face_id
+                    next_face_id += 1
+                    
+                    active_tracks[new_id] = {
+                        'last_position': face_center,
+                        'frames_visible': 1,
+                        'frames_since_seen': 0,
+                        'total_frames': len(tracked_faces)
+                    }
+                    
+                    face['id'] = new_id
+                    current_tracked.append(face)
+                    matched_ids.add(new_id)
+            
+            # Update and clean up tracks
+            for track_id in list(active_tracks.keys()):
+                if track_id not in matched_ids:
+                    track = active_tracks[track_id]
+                    track['frames_since_seen'] += 1
+                    
+                    # Remove tracks that haven't been seen for a while
+                    if track['frames_since_seen'] > 30:  # 1 second at 30fps
+                        del active_tracks[track_id]
+            
+            tracked_faces.append(current_tracked)
+            
+        return tracked_faces
+
+    def _analyze_frame_window(self, frame_idx: int, faces: List[Dict], 
+                            analysis: Dict, look_ahead: int = 30, look_back: int = 15) -> Dict:
+        """Analyze a window of frames before and after the current frame to make better movement decisions"""
+        # Initialize with default response for when no valid tracks are found
+        default_response = {
+            'tracks': [],
+            'best_track': None,
+            'has_competing_speaker': False,
+            'fallback_face': None
+        }
+        
+        # Validate input data
+        if not analysis or 'speaking_frames' not in analysis:
+            if faces:  # Fallback: use most central face
+                center_of_frame = analysis.get('frame_width', 1920) / 2
+                fallback_face = min(faces, key=lambda f: abs(f['center'] - center_of_frame))
+                default_response['fallback_face'] = fallback_face
+            return default_response
+            
+        start_idx = max(0, frame_idx - look_back)
+        end_idx = min(len(analysis['speaking_frames']), frame_idx + look_ahead)
+        
+        # If current frame is beyond our analysis data, use fallback
+        if frame_idx >= len(analysis['speaking_frames']):
+            if faces:
+                center_of_frame = analysis.get('frame_width', 1920) / 2
+                fallback_face = min(faces, key=lambda f: abs(f['center'] - center_of_frame))
+                default_response['fallback_face'] = fallback_face
+            return default_response
+        
+        # Track faces through the window
+        face_tracks = {}
+        
+        # Analyze past frames first
+        face_positions = analysis.get('face_positions', [])
+        for i in range(start_idx, frame_idx):
+            if i >= len(face_positions):
+                break
+                
+            frame_faces = face_positions[i]
+            speaking_score = analysis['speaking_frames'][i] if i < len(analysis['speaking_frames']) else 0.0
+            
+            for face in frame_faces:
+                center = face['center']
+                matched = False
+                for track in face_tracks.values():
+                    if abs(track['last_pos'] - center) < track['width'] * 0.5:
+                        track['positions'].append(center)
+                        track['speaking_scores'].append(speaking_score)
+                        track['last_pos'] = center
+                        matched = True
+                        break
+                
+                if not matched:
+                    track_id = len(face_tracks)
+                    face_tracks[track_id] = {
+                        'positions': [center],
+                        'speaking_scores': [speaking_score],
+                        'last_pos': center,
+                        'width': face['bbox'][2],
+                        'current_face': None,
+                        'speaking_runs': [],
+                        'current_run': 0,
+                        'consistency_score': 0.0,
+                        'last_speaking_frame': i if speaking_score > 0.4 else -1
+                    }
+
+        # Match current faces to tracks and update consistency scores
+        for face in faces:
+            center = face['center']
+            matched = False
+            for track in face_tracks.values():
+                if abs(track['last_pos'] - center) < track['width'] * 0.5:
+                    track['positions'].append(center)
+                    track['speaking_scores'].append(0.0)  # Will be updated with current frame speaking score
+                    track['last_pos'] = center
+                    track['current_face'] = face
+                    # Calculate position consistency
+                    if len(track['positions']) > 1:
+                        pos_std = np.std(track['positions'])
+                        track['consistency_score'] = 1.0 / (1.0 + pos_std)
+                    matched = True
+                    break
+            
+            if not matched:
+                track_id = len(face_tracks)
+                face_tracks[track_id] = {
+                    'positions': [center],
+                    'speaking_scores': [0.0],
+                    'last_pos': center,
+                    'width': face['bbox'][2],
+                    'current_face': face,
+                    'speaking_runs': [],
+                    'current_run': 0,
+                    'consistency_score': 1.0,  # New track starts with perfect consistency
+                    'last_speaking_frame': -1
+                }
+
+        # Process speaking runs and calculate scores with enhanced consideration for consistency
+        track_scores = []
+        for track_id, track in face_tracks.items():
+            if track['current_face'] is None:
+                continue
+
+            # Calculate sustained speech patterns with enhanced multi-face awareness
+            speaking_runs = []
+            current_run = 0
+            last_speaking_frame = -1
+            
+            for i, score in enumerate(track['speaking_scores']):
+                if score > 0.4:
+                    if last_speaking_frame == i - 1:
+                        current_run += 1
+                    else:
+                        if current_run > 0:
+                            speaking_runs.append(current_run)
+                        current_run = 1
+                    last_speaking_frame = i
+                else:
+                    if current_run > 0:
+                        speaking_runs.append(current_run)
+                    current_run = 0
+
+            if current_run > 0:
+                speaking_runs.append(current_run)
+
+            # Enhanced multi-face specific metrics
+            duration = len(track['positions'])
+            speaking_duration = sum(1 for score in track['speaking_scores'] if score > 0.4)
+            max_speaking_run = max(speaking_runs) if speaking_runs else 0
+            
+            # Calculate position stability with stricter thresholds for multi-face
+            if len(track['positions']) > 1:
+                pos_variations = np.diff(track['positions'])
+                stability_score = np.exp(-np.std(pos_variations) / 50.0)  # Exponential decay for variations
+            else:
+                stability_score = 0.5
+
+            # Enhanced future prediction for multi-face scenarios
+            future_idx = frame_idx - start_idx + 1
+            future_scores = track['speaking_scores'][future_idx:] if future_idx < len(track['speaking_scores']) else []
+            future_speaking = 0
+            future_weight = 1.0
+            for i, score in enumerate(future_scores):
+                if score > 0.4:
+                    future_speaking += future_weight
+                future_weight *= 0.95  # Decay weight for further future frames
+
+            # Enhanced past analysis with recency bias
+            past_scores = track['speaking_scores'][:future_idx]
+            past_speaking = 0
+            past_weight = 1.0
+            for i, score in enumerate(reversed(past_scores)):
+                if score > 0.4:
+                    past_speaking += past_weight
+                past_weight *= 0.9  # Steeper decay for past frames
+
+            # Calculate relative position to other faces
+            if len(faces) > 1:
+                other_positions = [f['center'] for f in faces if f['center'] != track['last_pos']]
+                if other_positions:
+                    avg_separation = min(abs(track['last_pos'] - pos) for pos in other_positions)
+                    separation_score = min(1.0, avg_separation / (analysis.get('frame_width', 1920) * 0.2))
+                else:
+                    separation_score = 1.0
+            else:
+                separation_score = 1.0
+
+            # Enhanced consistency calculation
+            consistency_window = 15  # Half second at 30fps
+            recent_positions = track['positions'][-consistency_window:]
+            if len(recent_positions) > 1:
+                recent_std = np.std(recent_positions)
+                consistency_score = 1.0 / (1.0 + recent_std / 50.0)  # Normalize by pixel variation
+            else:
+                consistency_score = 0.5
+
+            score = {
+                'face': track['current_face'],
+                'track_id': track_id,
+                'duration': duration,
+                'speaking_duration': speaking_duration,
+                'max_speaking_run': max_speaking_run,
+                'future_speaking': future_speaking,
+                'past_speaking': past_speaking,
+                'position_stability': stability_score,
+                'consistency_score': consistency_score,
+                'separation_score': separation_score,
+                'total_score': (
+                    speaking_duration * 1.5 +      # Base speaking duration
+                    max_speaking_run * 2.0 +       # Sustained speech importance
+                    future_speaking * 2.5 +        # Increased future importance
+                    past_speaking * 1.5 +          # Recent history importance
+                    stability_score * 2.0 +        # Position stability
+                    consistency_score * 2.0 +      # Track consistency
+                    separation_score * 1.5         # Spatial separation from other faces
+                )
+            }
+            
+            # Additional multi-face bonuses
+            if len(faces) > 1:
+                if max_speaking_run > 15:  # Bonus for very long speaking runs
+                    score['total_score'] *= 1.2
+                if stability_score > 0.8:  # Bonus for highly stable positions
+                    score['total_score'] *= 1.15
+                if separation_score > 0.9:  # Bonus for well-separated faces
+                    score['total_score'] *= 1.1
+            
+            track_scores.append(score)
+
+        # Sort tracks by score
+        track_scores.sort(key=lambda x: x['total_score'], reverse=True)
+
+        # Determine fallback face (most stable or central face)
+        fallback_face = None
+        if track_scores:
+            # Prefer the most stable track that has been around for a while
+            stable_tracks = [t for t in track_scores if t['duration'] > 15 and t['consistency_score'] > 0.7]
+            if stable_tracks:
+                fallback_face = stable_tracks[0]['face']
+            else:
+                # Fall back to most central face
+                center_of_frame = analysis.get('frame_width', 1920) / 2
+                fallback_face = min((t['face'] for t in track_scores), 
+                                  key=lambda f: abs(f['center'] - center_of_frame))
+
+        return {
+            'tracks': track_scores,
+            'best_track': track_scores[0] if track_scores else None,
+            'has_competing_speaker': len(track_scores) > 1 and 
+                                   track_scores[1]['total_score'] > track_scores[0]['total_score'] * 0.8,
+            'fallback_face': fallback_face
+        }
+
+    def _should_transition_to_face(self, current_pos: float, target_pos: float, face_count: int, 
+                                 target_in_frame: bool, target_width: float) -> Tuple[bool, str]:
+        """Determine if and how we should transition to a new face position"""
+        if face_count == 1:
+            # Single face - quicker transitions
+            if not target_in_frame:
+                return True, 'cut'
+            
+            face_offset = abs(current_pos - target_pos)
+            if face_offset <= target_width * 0.35:
+                return False, 'none'
+            elif face_offset > target_width * 0.5:
+                return True, 'cut'
+            else:
+                return True, 'smooth'
+        else:
+            # Multiple faces - more conservative movement
+            face_offset = abs(current_pos - target_pos)
+            
+            # Never do hard cuts with multiple faces
+            if face_offset > target_width * 0.8:
+                # Only move if target is significantly out of frame
+                return True, 'smooth'
+            
+            # If face is mostly in frame, stay still to avoid jitter
+            if face_offset <= target_width * 0.45:
+                return False, 'none'
+            
+            # For intermediate offsets, require larger threshold for movement
+            if face_offset > target_width * 0.6:
+                # Use extra smooth transition for multi-face scenarios
+                return True, 'extra_smooth'
+                
+            return False, 'none'
 
 # Create a singleton instance
 video_processor = VideoProcessor()
