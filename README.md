@@ -21,6 +21,25 @@ Additionally the goal is to have everything run locally (no need to pay for Open
 
 ## Future Thoughts
 -   **Better Clip Selection**: I might create a system that does facial and speaker detection on the entire video from start to finish, then do crop analysis to determine sections of the video where faces can be stable inside the final crop, from there I can determine the approx start and end times of clips, then analyse the transcripts and perform sentiment analysis and conversation detection, adjust for start and ends of conversations and build clips around that.
+-   **Remember This Logic**: Mapping speech to specific faces would be significantly more complex but achievable using deep learning models. Here's what it would involve:
+
+1. Audio-Visual Speech Detection using a model like TalkNet (available on HuggingFace) which can:
+   - Track faces in video
+   - Extract lip movements
+   - Process audio features
+   - Match audio with corresponding face movements to identify who is speaking
+
+2. Key challenges:
+   - Processing would be slower due to the more complex ML pipeline
+   - Would need more GPU resources
+   - Need to handle multiple speakers talking simultaneously
+   - Lip sync accuracy can be affected by video quality and face angles
+
+Yes, we could implement this using HuggingFace models like:
+- "speech-seq2seq/wav2vec2-speechbrain-talknet" for audio-visual sync
+- "vumichien/wav2vec2-large-xlsr-53-speaker-id" for speaker diarization
+
+The implementation would be about 2-3x more complex than the current solution, requiring additional dependencies and more sophisticated synchronization between audio and visual features. But it would provide more accurate speaker identification, especially in scenes with multiple people talking.
 
 ## Installation
 
